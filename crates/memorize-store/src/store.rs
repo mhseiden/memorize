@@ -1,4 +1,4 @@
-use crate::EMBED_DIM;
+use crate::DEFAULT_EMBED_DIM;
 use crate::schema::{fts_index_sql, schema_sql};
 use crate::synonyms_seed::DEFAULT_PAIRS;
 use anyhow::{Context, Result, bail};
@@ -12,6 +12,7 @@ use std::sync::Mutex;
 /// the contention is negligible.
 pub struct Store {
     conn: Mutex<Connection>,
+    embed_dim: usize,
 }
 
 /// BM25 + vector recall results carry the obs id, session (for diversification),
@@ -30,27 +31,81 @@ pub struct VectorHit {
     pub score: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct CodeBM25Hit {
+    pub id: i64,
+    pub path: String,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodeVectorHit {
+    pub id: i64,
+    pub path: String,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CodeChunkRow {
+    pub id: i64,
+    pub path: String,
+    pub language: String,
+    pub line_start: i32,
+    pub line_end: i32,
+    pub kind: String,
+    pub qualified: String,
+    pub body: String,
+}
+
+/// File-level metadata as stored in the `files` table — used by the indexer
+/// to decide whether a notify event actually requires reparse.
+#[derive(Debug, Clone)]
+pub struct FileMeta {
+    pub mtime_ns: i64,
+    pub size_bytes: i64,
+    pub git_rev: Option<String>,
+}
+
 impl Store {
-    /// Open (creating if needed) a DuckDB at the given path. Applies schema +
-    /// FTS index + first-run synonym seed.
+    /// Open (creating if needed) a DuckDB at the given path with the default
+    /// embedding dim (384, MiniLM). Production code uses this.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with_dim(path, DEFAULT_EMBED_DIM)
+    }
+
+    /// Open with a specific embedding dim. Use this when the corpus was
+    /// embedded by a non-default model. Schema is parameterized so
+    /// `vec.emb` is `FLOAT[dim]`.
+    pub fn open_with_dim<P: AsRef<Path>>(path: P, dim: usize) -> Result<Self> {
         let conn = Connection::open(path).context("open duckdb")?;
-        let store = Store { conn: Mutex::new(conn) };
+        let store = Store { conn: Mutex::new(conn), embed_dim: dim };
         store.init()?;
         Ok(store)
     }
 
-    /// In-memory DB for tests. Schema applied; synonyms seeded.
+    /// In-memory store at the default dim — used by store tests.
     pub fn open_in_memory() -> Result<Self> {
+        Self::open_in_memory_with_dim(DEFAULT_EMBED_DIM)
+    }
+
+    /// In-memory store at a specific dim. Used by the eval harness, which
+    /// builds an ephemeral index per question whose vector dim depends on
+    /// the active embedder.
+    pub fn open_in_memory_with_dim(dim: usize) -> Result<Self> {
         let conn = Connection::open_in_memory().context("open in-memory duckdb")?;
-        let store = Store { conn: Mutex::new(conn) };
+        let store = Store { conn: Mutex::new(conn), embed_dim: dim };
         store.init()?;
         Ok(store)
+    }
+
+    pub fn embed_dim(&self) -> usize {
+        self.embed_dim
     }
 
     fn init(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch(&schema_sql()).context("apply schema")?;
+        conn.execute_batch(&schema_sql(self.embed_dim))
+            .context("apply schema")?;
         conn.execute_batch(fts_index_sql()).context("create fts index")?;
         drop(conn);
         self.seed_synonyms_once()?;
@@ -82,33 +137,64 @@ impl Store {
         Ok(())
     }
 
-    /// Returns the assigned (id, ts).
+    /// Convenience wrapper for the single-vector case used by tests.
     pub fn insert_obs(&self, obs: &NewObservation, ts: i64, emb: &[f32]) -> Result<i64> {
-        if emb.len() != EMBED_DIM {
-            bail!(
-                "embedding length {} doesn't match EMBED_DIM={}",
-                emb.len(),
-                EMBED_DIM
-            );
+        self.insert_obs_chunked(obs, ts, std::slice::from_ref(&emb))
+    }
+
+    /// Insert with N chunk embeddings (the production path). The obs body is
+    /// stored once in `obs.body` for BM25; each chunk embedding lands in
+    /// `vec_chunks`. Callers (the server) are responsible for chunking the
+    /// body and producing matching embeddings.
+    pub fn insert_obs_chunked(
+        &self,
+        obs: &NewObservation,
+        ts: i64,
+        chunk_embs: &[&[f32]],
+    ) -> Result<i64> {
+        if chunk_embs.is_empty() {
+            bail!("insert_obs_chunked requires at least one chunk embedding");
+        }
+        for (i, emb) in chunk_embs.iter().enumerate() {
+            if emb.len() != self.embed_dim {
+                bail!(
+                    "chunk {} embedding length {} doesn't match store embed_dim={}",
+                    i,
+                    emb.len(),
+                    self.embed_dim
+                );
+            }
         }
         let conn = self.conn.lock().unwrap();
         let id: i64 = conn.query_row(
-            "INSERT INTO obs(id, ts, session, branch, kind, body)
+            "INSERT INTO obs(id, ts, session, branch, kind, body,
+                             ref_path, ref_line_start, ref_line_end)
              VALUES (
                  COALESCE((SELECT MAX(id) FROM obs), 0) + 1,
-                 ?, ?, ?, ?, ?
+                 ?, ?, ?, ?, ?, ?, ?, ?
              ) RETURNING id",
-            params![ts, obs.session, obs.branch, obs.kind.as_str(), obs.body],
+            params![
+                ts,
+                obs.session,
+                obs.branch,
+                obs.kind.as_str(),
+                obs.body,
+                obs.ref_path,
+                obs.ref_line_start,
+                obs.ref_line_end,
+            ],
             |row| row.get(0),
         )?;
-        // Embedding insert via SQL literal — embeddings are our own f32s, no
-        // injection surface, and parameter-binding fixed-size arrays in
-        // duckdb-rs is awkward.
-        let literal = float_array_literal(emb);
-        let insert_vec = format!(
-            "INSERT INTO vec(id, emb) VALUES ({id}, {literal}::FLOAT[{EMBED_DIM}])"
-        );
-        conn.execute_batch(&insert_vec)?;
+        let dim = self.embed_dim;
+        // One INSERT per chunk. Bounded by chunk count — typically 1–5.
+        for (idx, emb) in chunk_embs.iter().enumerate() {
+            let literal = float_array_literal(emb);
+            let sql = format!(
+                "INSERT INTO vec_chunks(obs_id, chunk_idx, emb)
+                 VALUES ({id}, {idx}, {literal}::FLOAT[{dim}])"
+            );
+            conn.execute_batch(&sql)?;
+        }
         Ok(id)
     }
 
@@ -138,24 +224,33 @@ impl Store {
         Ok(rows)
     }
 
-    /// Cosine over vec.emb. We never read embeddings back into Rust — DuckDB
-    /// runs the comparison and returns a scalar score per row.
+    /// Cosine over per-chunk embeddings. Each chunk is scored independently;
+    /// the obs takes its best-matching chunk's score (max-pool). This is the
+    /// IR-literature recommended multi-vector retrieval pattern — if just one
+    /// chunk of a long observation is on-topic, that chunk surfaces the obs
+    /// rather than getting averaged-out across irrelevant chunks.
     pub fn search_vector(&self, query_emb: &[f32], limit: usize) -> Result<Vec<VectorHit>> {
-        if query_emb.len() != EMBED_DIM {
+        if query_emb.len() != self.embed_dim {
             bail!(
-                "query embedding length {} doesn't match EMBED_DIM={}",
+                "query embedding length {} doesn't match store embed_dim={}",
                 query_emb.len(),
-                EMBED_DIM
+                self.embed_dim
             );
         }
         let conn = self.conn.lock().unwrap();
         let literal = float_array_literal(query_emb);
+        let dim = self.embed_dim;
         let sql = format!(
-            "SELECT v.id, o.session,
-                    array_cosine_similarity(v.emb, {literal}::FLOAT[{EMBED_DIM}]) AS s
-               FROM vec v JOIN obs o ON o.id = v.id
-              ORDER BY s DESC
-              LIMIT ?"
+            "SELECT obs_id, session, score FROM (
+                SELECT vc.obs_id AS obs_id,
+                       o.session AS session,
+                       MAX(array_cosine_similarity(vc.emb, {literal}::FLOAT[{dim}])) AS score
+                  FROM vec_chunks vc
+                  JOIN obs o ON o.id = vc.obs_id
+              GROUP BY vc.obs_id, o.session
+             ) sub
+            ORDER BY score DESC
+            LIMIT ?"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
@@ -178,7 +273,8 @@ impl Store {
         }
         let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT id, ts, session, branch, kind, body
+            "SELECT id, ts, session, branch, kind, body,
+                    ref_path, ref_line_start, ref_line_end
                FROM obs WHERE id IN ({placeholders})"
         );
         let conn = self.conn.lock().unwrap();
@@ -195,6 +291,9 @@ impl Store {
                     branch: row.get(3)?,
                     kind: Kind::from_str(&kind),
                     body: row.get(5)?,
+                    ref_path: row.get(6)?,
+                    ref_line_start: row.get(7)?,
+                    ref_line_end: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<Observation>, _>>()?;
@@ -283,16 +382,299 @@ impl Store {
     }
 
     /// Drop observations older than `cutoff_ts`. Returns rows removed.
-    /// Vector rows are cleaned in the same pass.
+    /// Orphaned vector rows (both legacy `vec` and `vec_chunks`) are cleaned
+    /// in the same pass.
     pub fn evict_older_than(&self, cutoff_ts: i64) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let deleted = conn.execute("DELETE FROM obs WHERE ts < ?", params![cutoff_ts])?;
+        conn.execute("DELETE FROM vec WHERE id NOT IN (SELECT id FROM obs)", [])?;
         conn.execute(
-            "DELETE FROM vec WHERE id NOT IN (SELECT id FROM obs)",
+            "DELETE FROM vec_chunks WHERE obs_id NOT IN (SELECT id FROM obs)",
             [],
         )?;
         Ok(deleted)
     }
+
+    // ---- Code index methods ----
+
+    /// Look up current file metadata. None if we haven't indexed this path.
+    pub fn get_file_meta(&self, path: &str) -> Result<Option<FileMeta>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT mtime_ns, size_bytes, git_rev FROM files WHERE path = ?",
+                params![path],
+                |row| {
+                    Ok(FileMeta {
+                        mtime_ns: row.get(0)?,
+                        size_bytes: row.get(1)?,
+                        git_rev: row.get(2)?,
+                    })
+                },
+            )
+            .ok();
+        Ok(row)
+    }
+
+    /// Upsert files row + replace all code_chunks for this path with the
+    /// supplied set. Embeddings are inserted in lockstep via vec_code.
+    /// Caller is responsible for matching chunks.len() == chunk_embs.len().
+    pub fn upsert_code_file(
+        &self,
+        path: &str,
+        repo_root: &str,
+        language: &str,
+        meta: &FileMeta,
+        chunks: &[CodeChunkRow],
+        chunk_embs: &[Vec<f32>],
+    ) -> Result<()> {
+        if chunks.len() != chunk_embs.len() {
+            bail!(
+                "chunks ({}) and chunk_embs ({}) length mismatch",
+                chunks.len(),
+                chunk_embs.len()
+            );
+        }
+        for (i, emb) in chunk_embs.iter().enumerate() {
+            if emb.len() != self.embed_dim {
+                bail!(
+                    "chunk {} embedding length {} doesn't match store embed_dim={}",
+                    i,
+                    emb.len(),
+                    self.embed_dim
+                );
+            }
+        }
+        let conn = self.conn.lock().unwrap();
+
+        // Remove any existing chunks for this path; their ids are stale.
+        let stale_ids: Vec<i64> = {
+            let mut stmt =
+                conn.prepare("SELECT id FROM code_chunks WHERE path = ?")?;
+            let rows = stmt.query_map(params![path], |row| row.get::<_, i64>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if !stale_ids.is_empty() {
+            let placeholders: String =
+                stale_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let del_chunks = format!("DELETE FROM code_chunks WHERE id IN ({placeholders})");
+            let del_vec = format!("DELETE FROM vec_code WHERE id IN ({placeholders})");
+            let params_vec: Vec<&dyn duckdb::ToSql> =
+                stale_ids.iter().map(|id| id as &dyn duckdb::ToSql).collect();
+            conn.execute(&del_chunks, params_vec.as_slice())?;
+            conn.execute(&del_vec, params_vec.as_slice())?;
+        }
+
+        // Upsert files row.
+        conn.execute(
+            "INSERT INTO files(path, repo_root, language, mtime_ns, size_bytes, git_rev)
+                  VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(path) DO UPDATE SET
+                repo_root = EXCLUDED.repo_root,
+                language = EXCLUDED.language,
+                mtime_ns = EXCLUDED.mtime_ns,
+                size_bytes = EXCLUDED.size_bytes,
+                git_rev = EXCLUDED.git_rev",
+            params![
+                path,
+                repo_root,
+                language,
+                meta.mtime_ns,
+                meta.size_bytes,
+                meta.git_rev
+            ],
+        )?;
+
+        // Allocate ids and insert chunks + embeddings.
+        let base: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM code_chunks",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let dim = self.embed_dim;
+        for (i, c) in chunks.iter().enumerate() {
+            let id = base + 1 + i as i64;
+            conn.execute(
+                "INSERT INTO code_chunks(id, path, language, line_start, line_end,
+                                         kind, qualified, body, body_hash)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    id,
+                    path,
+                    c.language,
+                    c.line_start,
+                    c.line_end,
+                    c.kind,
+                    c.qualified,
+                    c.body,
+                    hash_bytes(c.body.as_bytes()),
+                ],
+            )?;
+            let literal = float_array_literal(&chunk_embs[i]);
+            let insert_vec = format!(
+                "INSERT INTO vec_code(id, emb) VALUES ({id}, {literal}::FLOAT[{dim}])"
+            );
+            conn.execute_batch(&insert_vec)?;
+        }
+        Ok(())
+    }
+
+    /// Drop all chunks + vec rows for a deleted file.
+    pub fn delete_code_file(&self, path: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let stale_ids: Vec<i64> = {
+            let mut stmt =
+                conn.prepare("SELECT id FROM code_chunks WHERE path = ?")?;
+            let rows = stmt.query_map(params![path], |row| row.get::<_, i64>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if !stale_ids.is_empty() {
+            let placeholders: String =
+                stale_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let del_chunks = format!("DELETE FROM code_chunks WHERE id IN ({placeholders})");
+            let del_vec = format!("DELETE FROM vec_code WHERE id IN ({placeholders})");
+            let params_vec: Vec<&dyn duckdb::ToSql> =
+                stale_ids.iter().map(|id| id as &dyn duckdb::ToSql).collect();
+            conn.execute(&del_chunks, params_vec.as_slice())?;
+            conn.execute(&del_vec, params_vec.as_slice())?;
+        }
+        conn.execute("DELETE FROM files WHERE path = ?", params![path])?;
+        Ok(())
+    }
+
+    pub fn count_code_chunks(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row("SELECT COUNT(*) FROM code_chunks", [], |r| r.get(0))?)
+    }
+
+    /// BM25 over code_chunks.body. Optional language and path-prefix filters.
+    pub fn search_code_bm25(
+        &self,
+        query: &str,
+        limit: usize,
+        language: Option<&str>,
+        path_prefix: Option<&str>,
+    ) -> Result<Vec<CodeBM25Hit>> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = String::from(
+            "SELECT cc.id, cc.path,
+                    fts_main_code_chunks.match_bm25(cc.id, ?) AS score
+               FROM code_chunks cc
+              WHERE score IS NOT NULL",
+        );
+        let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = vec![Box::new(query.to_string())];
+        if let Some(lang) = language {
+            sql.push_str(" AND cc.language = ?");
+            params_vec.push(Box::new(lang.to_string()));
+        }
+        if let Some(prefix) = path_prefix {
+            sql.push_str(" AND cc.path LIKE ?");
+            params_vec.push(Box::new(format!("{prefix}%")));
+        }
+        sql.push_str(" ORDER BY score DESC LIMIT ?");
+        params_vec.push(Box::new(limit as i64));
+        let param_refs: Vec<&dyn duckdb::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok(CodeBM25Hit {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    score: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Vector cosine over vec_code.emb with optional filters.
+    pub fn search_code_vector(
+        &self,
+        query_emb: &[f32],
+        limit: usize,
+        language: Option<&str>,
+        path_prefix: Option<&str>,
+    ) -> Result<Vec<CodeVectorHit>> {
+        if query_emb.len() != self.embed_dim {
+            bail!(
+                "query embedding length {} doesn't match store embed_dim={}",
+                query_emb.len(),
+                self.embed_dim
+            );
+        }
+        let conn = self.conn.lock().unwrap();
+        let literal = float_array_literal(query_emb);
+        let dim = self.embed_dim;
+        let mut sql = format!(
+            "SELECT cc.id, cc.path,
+                    array_cosine_similarity(vc.emb, {literal}::FLOAT[{dim}]) AS s
+               FROM vec_code vc
+               JOIN code_chunks cc ON cc.id = vc.id
+              WHERE 1=1"
+        );
+        let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = vec![];
+        if let Some(lang) = language {
+            sql.push_str(" AND cc.language = ?");
+            params_vec.push(Box::new(lang.to_string()));
+        }
+        if let Some(prefix) = path_prefix {
+            sql.push_str(" AND cc.path LIKE ?");
+            params_vec.push(Box::new(format!("{prefix}%")));
+        }
+        sql.push_str(" ORDER BY s DESC LIMIT ?");
+        params_vec.push(Box::new(limit as i64));
+        let param_refs: Vec<&dyn duckdb::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok(CodeVectorHit {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    score: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_code_chunks_by_ids(&self, ids: &[i64]) -> Result<Vec<CodeChunkRow>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, path, language, line_start, line_end, kind, qualified, body
+               FROM code_chunks WHERE id IN ({placeholders})"
+        );
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn duckdb::ToSql> =
+            ids.iter().map(|id| id as &dyn duckdb::ToSql).collect();
+        let mut by_id: std::collections::HashMap<i64, CodeChunkRow> = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok(CodeChunkRow {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    language: row.get(2)?,
+                    line_start: row.get(3)?,
+                    line_end: row.get(4)?,
+                    kind: row.get(5)?,
+                    qualified: row.get(6)?,
+                    body: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|c| (c.id, c))
+            .collect();
+        Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
+    }
+
+    // ---- end code index methods ----
 
     /// Session register / upsert. Called from SessionStart hook.
     pub fn upsert_session(
@@ -333,13 +715,22 @@ fn float_array_literal(v: &[f32]) -> String {
     s
 }
 
+/// SHA-256 of arbitrary bytes. Used to detect when a code chunk's body is
+/// unchanged between re-indexes so we can skip embedding work.
+fn hash_bytes(bytes: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use memorize_core::Kind;
 
     fn dummy_emb(scale: f32) -> Vec<f32> {
-        (0..EMBED_DIM).map(|i| (i as f32 / EMBED_DIM as f32) * scale).collect()
+        (0..DEFAULT_EMBED_DIM).map(|i| (i as f32 / DEFAULT_EMBED_DIM as f32) * scale).collect()
     }
 
     #[test]
@@ -360,6 +751,7 @@ mod tests {
             kind: Kind::Manual,
             body: "learned about kubernetes pod scheduling".to_string(),
             branch: Some("main".to_string()),
+            ..Default::default()
         };
         let id = s.insert_obs(&obs, 1000, &dummy_emb(1.0)).unwrap();
         assert_eq!(id, 1);
@@ -374,6 +766,7 @@ mod tests {
             kind: Kind::Manual,
             body: "learned about kubernetes pod scheduling".to_string(),
             branch: None,
+            ..Default::default()
         };
         s.insert_obs(&obs, 1000, &dummy_emb(1.0)).unwrap();
         s.rebuild_fts().unwrap();
@@ -391,6 +784,7 @@ mod tests {
             kind: Kind::Manual,
             body: "anything".to_string(),
             branch: None,
+            ..Default::default()
         };
         s.insert_obs(&obs, 1000, &dummy_emb(1.0)).unwrap();
         let hits = s.search_vector(&dummy_emb(1.0), 10).unwrap();
@@ -427,6 +821,7 @@ mod tests {
             kind: Kind::Manual,
             body: body.to_string(),
             branch: None,
+            ..Default::default()
         };
         s.insert_obs(&mk("old"), 100, &dummy_emb(1.0)).unwrap();
         s.insert_obs(&mk("new"), 1000, &dummy_emb(1.0)).unwrap();
@@ -443,6 +838,7 @@ mod tests {
             kind: Kind::Manual,
             body: body.to_string(),
             branch: None,
+            ..Default::default()
         };
         let a = s.insert_obs(&mk("alpha"), 100, &dummy_emb(1.0)).unwrap();
         let b = s.insert_obs(&mk("beta"), 200, &dummy_emb(1.0)).unwrap();

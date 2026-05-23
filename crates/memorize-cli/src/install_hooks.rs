@@ -25,9 +25,14 @@ const CLAUDE_MD_LEGACY_MARKER: &str = "<!-- memorize:recall-hint -->";
 const CLAUDE_MD_HINT: &str = r#"
 
 <!-- memorize:recall-hint:start -->
-## Memory tool
+## Memory tools
 
-You have persistent memory of prior Claude Code sessions in this environment, exposed as MCP tools `memory_recall(query, limit?)` and `memory_save(text)`. Call `memory_recall` proactively whenever the user's question references prior work, decisions, or things "we" did — *before* exploring the codebase from scratch. Capture of prompts and tool calls is automatic via hooks; call `memory_save` only for durable conclusions worth keeping.
+You have two MCP recall tools backed by the local memorize daemon:
+
+- `session_recall(query, limit?)` — searches prior session conversation memory (user prompts, your past assistant messages, subagent results, and compact references to files touched in prior sessions). Reach for this whenever the user's question references prior work, decisions, or things "we" did.
+- `code_recall(query, limit?, language?, path_prefix?)` — searches a local code index that's kept fresh on file save. AST-chunked via tree-sitter, returns function/class-level snippets with `{path, line_start, line_end}`. Reach for this when you need to find where something is defined or how a concept is implemented across the codebase, before resorting to `Grep`/`Glob` from scratch.
+
+The session index records *intent and conclusions* — not file contents. Tool calls store compact references like `Read(src/foo.rs:10-50)`; dereference them via `code_recall` or your own `Read` tool when you need the current code.
 <!-- memorize:recall-hint:end -->
 "#;
 

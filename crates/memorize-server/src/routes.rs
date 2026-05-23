@@ -1,7 +1,7 @@
 use crate::state::ServerState;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
-use memorize_core::{Kind, NewObservation, truncate_body};
+use memorize_core::{Kind, NewObservation, chunk_for_embedding, truncate_body};
 use memorize_recall::recall;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -16,6 +16,12 @@ struct CaptureReq {
     body: String,
     #[serde(default)]
     branch: Option<String>,
+    #[serde(default)]
+    ref_path: Option<String>,
+    #[serde(default)]
+    ref_line_start: Option<i32>,
+    #[serde(default)]
+    ref_line_end: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -39,6 +45,17 @@ enum SynReq {
     Remove { term: String, #[serde(default)] expansion: Option<String> },
 }
 
+#[derive(Debug, Deserialize)]
+struct CodeSearchReq {
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    path_prefix: Option<String>,
+}
+
 /// Bind and serve. Blocks the calling thread; spawn before calling if you
 /// want a background server.
 pub fn serve(state: ServerState, bind: &str) -> Result<()> {
@@ -59,6 +76,12 @@ pub fn serve(state: ServerState, bind: &str) -> Result<()> {
     }
 
     let state = Arc::new(state);
+
+    // Background code indexer: cold-scan + watcher. Skipped if disabled.
+    if std::env::var("MEMORIZE_CODE_INDEX").as_deref() != Ok("0") {
+        crate::code_indexer::spawn(state.clone());
+    }
+
     for req in server.incoming_requests() {
         let st = state.clone();
         // Single-threaded server for simplicity. Hooks fire one at a time per
@@ -99,6 +122,12 @@ fn handle(state: &ServerState, mut req: Request) -> Result<()> {
             let parsed: SynReq = serde_json::from_str(&body).context("parse /syn body")?;
             handle_syn(state, req, parsed)
         }
+        (Method::Post, "/code/search") => {
+            let body = read_body(&mut req)?;
+            let parsed: CodeSearchReq =
+                serde_json::from_str(&body).context("parse /code/search body")?;
+            handle_code_search(state, req, parsed)
+        }
         _ => respond_text(req, 404, "not found"),
     }
 }
@@ -129,8 +158,12 @@ fn handle_capture(state: &ServerState, req: Request, payload: CaptureReq) -> Res
         );
     }
 
-    // 4. Embed.
-    let emb = memorize_embed::embed(&body).context("embed")?;
+    // 4. Chunk + embed. Each chunk fits inside the embedder's context window;
+    //    one vector per chunk lands in vec_chunks, BM25 still indexes the
+    //    full body for full-length lexical recall.
+    let chunks = chunk_for_embedding(&body);
+    let chunk_embs = memorize_embed::embed_batch(&chunks).context("embed chunks")?;
+    let chunk_emb_refs: Vec<&[f32]> = chunk_embs.iter().map(|v| v.as_slice()).collect();
 
     // 5. Persist.
     let obs = NewObservation {
@@ -138,8 +171,14 @@ fn handle_capture(state: &ServerState, req: Request, payload: CaptureReq) -> Res
         kind,
         body,
         branch: payload.branch,
+        ref_path: payload.ref_path,
+        ref_line_start: payload.ref_line_start,
+        ref_line_end: payload.ref_line_end,
     };
-    let id = state.store.insert_obs(&obs, now, &emb).context("insert obs")?;
+    let id = state
+        .store
+        .insert_obs_chunked(&obs, now, &chunk_emb_refs)
+        .context("insert obs")?;
 
     respond_json(
         req,
@@ -191,6 +230,67 @@ fn handle_context(state: &ServerState, req: Request, query: &str, budget: usize)
         md.push_str(&line);
     }
     respond_text(req, 200, &md)
+}
+
+fn handle_code_search(state: &ServerState, req: Request, payload: CodeSearchReq) -> Result<()> {
+    // FTS index needs a rebuild if recent code chunks were written; cheap.
+    let _ = state.store.rebuild_fts();
+    let q = payload.query.trim();
+    if q.is_empty() {
+        return respond_json(req, 200, &Vec::<serde_json::Value>::new());
+    }
+    let limit = payload.limit.unwrap_or(10);
+    let per_stream = 50usize;
+    let lang = payload.language.as_deref();
+    let prefix = payload.path_prefix.as_deref();
+
+    // BM25 + vector streams.
+    let bm25 = state
+        .store
+        .search_code_bm25(q, per_stream, lang, prefix)
+        .unwrap_or_default();
+    let q_emb = memorize_embed::embed(q).context("embed code query")?;
+    let vec_hits = state
+        .store
+        .search_code_vector(&q_emb, per_stream, lang, prefix)
+        .unwrap_or_default();
+
+    // RRF fusion (k=60), no diversification (each chunk is its own entity;
+    // multiple chunks from one file is fine — the model wants to see them).
+    use std::collections::HashMap;
+    let k = 60.0f64;
+    let mut acc: HashMap<i64, f64> = HashMap::new();
+    for (rank, hit) in bm25.iter().enumerate() {
+        *acc.entry(hit.id).or_default() += 1.0 / (k + (rank + 1) as f64);
+    }
+    for (rank, hit) in vec_hits.iter().enumerate() {
+        *acc.entry(hit.id).or_default() += 1.0 / (k + (rank + 1) as f64);
+    }
+    let mut fused: Vec<(i64, f64)> = acc.into_iter().collect();
+    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    fused.truncate(limit);
+
+    let ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
+    let rows = state.store.get_code_chunks_by_ids(&ids)?;
+    let scores: Vec<f64> = fused.iter().map(|(_, s)| *s).collect();
+    let out: Vec<serde_json::Value> = rows
+        .into_iter()
+        .zip(scores)
+        .map(|(r, s)| {
+            serde_json::json!({
+                "id": r.id,
+                "path": r.path,
+                "language": r.language,
+                "line_start": r.line_start,
+                "line_end": r.line_end,
+                "kind": r.kind,
+                "qualified": r.qualified,
+                "body": r.body,
+                "score": s,
+            })
+        })
+        .collect();
+    respond_json(req, 200, &out)
 }
 
 fn handle_syn(state: &ServerState, req: Request, payload: SynReq) -> Result<()> {

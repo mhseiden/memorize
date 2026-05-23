@@ -128,15 +128,14 @@ fn handle_initialize() -> Value {
 }
 
 fn handle_tools_list() -> Value {
-    // Tool + parameter descriptions adopted verbatim from upstream agentmemory
-    // (src/mcp/tools-registry.ts). Their wording, our (minimal) schemas — we
-    // don't expose params we can't honor (no format/token_budget/type/etc.
-    // in v1).
+    // Two tools, separate by intent. Agent chooses based on the query
+    // shape: prose questions → session_recall; code/symbol queries →
+    // code_recall.
     json!({
         "tools": [
             {
-                "name": "memory_recall",
-                "description": "Search past session observations for relevant context. Use when you need to recall what happened in previous sessions, find past decisions, or look up how a file was modified before.",
+                "name": "session_recall",
+                "description": "Search past session memory (user prompts, assistant messages, subagent results, and compact tool references) for relevant context. Use when the user's question references prior work, decisions, or things \"we\" did — before exploring from scratch.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -153,17 +152,29 @@ fn handle_tools_list() -> Value {
                 }
             },
             {
-                "name": "memory_save",
-                "description": "Explicitly save an important insight, decision, or pattern to long-term memory.",
+                "name": "code_recall",
+                "description": "Search the indexed local codebase for semantically relevant functions, classes, or code blocks. AST-chunked via tree-sitter, hybrid BM25 + vector. Returns {path, line_start, line_end, qualified, body}. Use when you need to find where something is defined or how a concept is implemented across the codebase.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "content": {
+                        "query": {
                             "type": "string",
-                            "description": "The insight or decision to remember"
+                            "description": "Search query (function names, type names, concepts)"
+                        },
+                        "limit": {
+                            "type": "number",
+                            "description": "Max results to return (default 10)"
+                        },
+                        "language": {
+                            "type": "string",
+                            "description": "Optional: filter by language (rust, typescript, python, go, bash, ...)"
+                        },
+                        "path_prefix": {
+                            "type": "string",
+                            "description": "Optional: filter to files under this path prefix"
                         }
                     },
-                    "required": ["content"]
+                    "required": ["query"]
                 }
             }
         ]
@@ -181,8 +192,10 @@ fn handle_tools_call(params: &Value, http_url: &str) -> Result<Value, RpcError> 
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
     match name {
+        "session_recall" => call_recall(&arguments, http_url),
+        "code_recall" => call_code_recall(&arguments, http_url),
+        // Back-compat: older agents may still send memory_recall.
         "memory_recall" => call_recall(&arguments, http_url),
-        "memory_save" => call_save(&arguments, http_url),
         other => Err(RpcError {
             code: -32602,
             message: format!("unknown tool: {other}"),
@@ -211,26 +224,62 @@ fn call_recall(args: &Value, http_url: &str) -> Result<Value, RpcError> {
     Ok(tool_result_text(&format_recall(&resp), false))
 }
 
-fn call_save(args: &Value, http_url: &str) -> Result<Value, RpcError> {
-    let content = args
-        .get("content")
+fn call_code_recall(args: &Value, http_url: &str) -> Result<Value, RpcError> {
+    let query = args
+        .get("query")
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError {
             code: -32602,
-            message: "memory_save: missing `content`".into(),
+            message: "code_recall: missing `query`".into(),
         })?;
-    let session = format!("mcp-{}", now_secs());
-    let payload = json!({
-        "session": session,
-        "kind": "manual",
-        "body": content,
-    });
-    let resp = http_post(&format!("{http_url}/capture"), &payload.to_string())
-        .map_err(|e| RpcError {
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10);
+    let mut body = json!({"query": query, "limit": limit});
+    if let Some(lang) = args.get("language").and_then(|v| v.as_str()) {
+        body["language"] = json!(lang);
+    }
+    if let Some(pp) = args.get("path_prefix").and_then(|v| v.as_str()) {
+        body["path_prefix"] = json!(pp);
+    }
+    let resp = http_post(&format!("{http_url}/code/search"), &body.to_string()).map_err(|e| {
+        RpcError {
             code: -32000,
             message: format!("server unreachable: {e}"),
-        })?;
-    Ok(tool_result_text(&resp, false))
+        }
+    })?;
+    Ok(tool_result_text(&format_code_recall(&resp), false))
+}
+
+/// Render the code/search JSON response as compact markdown for the model.
+fn format_code_recall(raw: &str) -> String {
+    let parsed: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return raw.to_string(),
+    };
+    let arr = match parsed.as_array() {
+        Some(a) => a,
+        None => return raw.to_string(),
+    };
+    if arr.is_empty() {
+        return "(no code matches)".to_string();
+    }
+    let mut out = String::new();
+    for hit in arr {
+        let path = hit.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        let line_start = hit.get("line_start").and_then(|v| v.as_i64()).unwrap_or(0);
+        let line_end = hit.get("line_end").and_then(|v| v.as_i64()).unwrap_or(0);
+        let qualified = hit.get("qualified").and_then(|v| v.as_str()).unwrap_or("");
+        let body = hit.get("body").and_then(|v| v.as_str()).unwrap_or("");
+        let score = hit.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let qual = if qualified.is_empty() {
+            String::new()
+        } else {
+            format!(" {qualified}")
+        };
+        out.push_str(&format!(
+            "─── {path}:{line_start}-{line_end}{qual} (rrf {score:.3}) ───\n{body}\n\n"
+        ));
+    }
+    out
 }
 
 /// MCP tool result body: `{content: [{type:"text", text:"..."}], isError: bool}`.
@@ -291,14 +340,6 @@ fn http_post(url: &str, body: &str) -> Result<String> {
     Ok(resp.into_string()?)
 }
 
-fn now_secs() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_two() {
+    fn tools_list_has_session_and_code() {
         let r = handle_tools_list();
         let tools = r["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
@@ -320,8 +361,8 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"memory_recall"));
-        assert!(names.contains(&"memory_save"));
+        assert!(names.contains(&"session_recall"));
+        assert!(names.contains(&"code_recall"));
     }
 
     #[test]

@@ -6,4 +6,5 @@ publish.workspace = true
 
 [dependencies]
 fastembed = { workspace = true }
+ort = { workspace = true }
 anyhow = { workspace = true }

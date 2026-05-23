@@ -1,1 +1,4 @@
 /target
+
+# Eval artifacts (regeneratable from the dataset + harness)
+/reports/

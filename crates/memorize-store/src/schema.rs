@@ -1,18 +1,24 @@
-use crate::EMBED_DIM;
-
-/// Idempotent schema. Safe to run on every startup.
-pub fn schema_sql() -> String {
+/// Idempotent schema. Safe to run on every startup. `dim` parameterizes the
+/// FLOAT[N] fixed-size vector type — production uses `DEFAULT_EMBED_DIM`,
+/// the eval harness passes the active model's dim.
+pub fn schema_sql(dim: usize) -> String {
     format!(
         r#"
 INSTALL fts; LOAD fts;
 
 CREATE TABLE IF NOT EXISTS obs (
-    id      BIGINT       PRIMARY KEY,
-    ts      BIGINT       NOT NULL,
-    session VARCHAR      NOT NULL,
-    branch  VARCHAR,
-    kind    VARCHAR      NOT NULL,
-    body    VARCHAR      NOT NULL
+    id             BIGINT  PRIMARY KEY,
+    ts             BIGINT  NOT NULL,
+    session        VARCHAR NOT NULL,
+    branch         VARCHAR,
+    kind           VARCHAR NOT NULL,
+    body           VARCHAR NOT NULL,
+    -- Optional file reference for tool-use obs (Read / Edit / Write / Bash).
+    -- Prose obs (user_prompt, assistant_message, subagent_message) leave
+    -- these NULL. Enables fast filtering by path without parsing body text.
+    ref_path       VARCHAR,
+    ref_line_start INTEGER,
+    ref_line_end   INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -24,8 +30,22 @@ CREATE TABLE IF NOT EXISTS sessions (
     summary    VARCHAR
 );
 
--- Embeddings sit alongside obs (1:1 by id). Kept in a separate table so the
--- text table stays narrow and recall over body alone touches less data.
+-- Per-chunk embeddings. Obs bodies are split into char-windowed chunks on
+-- insert (each chunk fits inside the embedder's token window), then one
+-- vector is stored per chunk. Recall does cosine against every chunk and
+-- group-by-obs max(score) as the vector contribution. BM25 still indexes
+-- the full body in obs.body, so we get full-body lexical recall plus
+-- chunk-level semantic recall in the same pipeline.
+CREATE TABLE IF NOT EXISTS vec_chunks (
+    obs_id    BIGINT  NOT NULL,
+    chunk_idx INTEGER NOT NULL,
+    emb       FLOAT[{dim}] NOT NULL,
+    PRIMARY KEY (obs_id, chunk_idx)
+);
+
+-- Retained for backward-compat with existing DBs from Phase 1–3. New
+-- inserts go into vec_chunks; legacy single-vector rows in `vec` are
+-- ignored by recall after the migration. Drop at user discretion.
 CREATE TABLE IF NOT EXISTS vec (
     id  BIGINT PRIMARY KEY,
     emb FLOAT[{dim}]
@@ -45,14 +65,52 @@ CREATE TABLE IF NOT EXISTS meta (
     key   VARCHAR PRIMARY KEY,
     value VARCHAR NOT NULL
 );
+
+-- Idempotent column additions for older DBs. DuckDB treats redundant ALTERs
+-- on already-present columns as no-ops when guarded by IF NOT EXISTS.
+ALTER TABLE obs ADD COLUMN IF NOT EXISTS ref_path       VARCHAR;
+ALTER TABLE obs ADD COLUMN IF NOT EXISTS ref_line_start INTEGER;
+ALTER TABLE obs ADD COLUMN IF NOT EXISTS ref_line_end   INTEGER;
+
+-- ---- Code index ----
+-- One row per indexed file. `mtime_ns` and `size_bytes` let us detect when
+-- a file changed without re-parsing on every event.
+CREATE TABLE IF NOT EXISTS files (
+    path       VARCHAR PRIMARY KEY,    -- absolute, normalized
+    repo_root  VARCHAR NOT NULL,
+    language   VARCHAR NOT NULL,
+    mtime_ns   BIGINT  NOT NULL,
+    size_bytes BIGINT  NOT NULL,
+    git_rev    VARCHAR
+);
+
+-- One row per AST chunk. Body hash makes re-indexing the same file a no-op
+-- when content didn't change.
+CREATE TABLE IF NOT EXISTS code_chunks (
+    id         BIGINT  PRIMARY KEY,
+    path       VARCHAR NOT NULL,
+    language   VARCHAR NOT NULL,
+    line_start INTEGER NOT NULL,
+    line_end   INTEGER NOT NULL,
+    kind       VARCHAR NOT NULL,
+    qualified  VARCHAR NOT NULL,
+    body       VARCHAR NOT NULL,
+    body_hash  BLOB    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vec_code (
+    id  BIGINT PRIMARY KEY,
+    emb FLOAT[{dim}] NOT NULL
+);
 "#,
-        dim = EMBED_DIM
+        dim = dim
     )
 }
 
-/// FTS index on `obs.body`. Run after the schema is in place. We rebuild the
-/// index after batched inserts because DuckDB's FTS has no incremental
-/// trigger; for our workload (single-user dogfood) the rebuild is cheap.
+/// FTS indexes — rebuilt periodically since DuckDB's FTS has no
+/// incremental update. Cheap at our scale.
 pub fn fts_index_sql() -> &'static str {
-    "PRAGMA create_fts_index('obs', 'id', 'body', overwrite=1);"
+    "PRAGMA create_fts_index('obs', 'id', 'body', overwrite=1);
+     PRAGMA create_fts_index('code_chunks', 'id', 'body', overwrite=1);
+     PRAGMA create_fts_index('code_chunks', 'id', 'qualified', overwrite=1);"
 }

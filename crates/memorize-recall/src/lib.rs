@@ -1,23 +1,50 @@
 //! Recall pipeline: tokenize → expand synonyms → run BM25 + vector cosine →
-//! fuse with RRF (k=60) → diversify by session (max 3) → hydrate observations.
+//! fuse with RRF → diversify by session → hydrate observations.
 //!
-//! Matches the same configuration agentmemory uses for its 95.2% R@5 on
-//! LongMemEval-S, so eval numbers transfer.
+//! Defaults match the configuration agentmemory uses for its 95.2% R@5 on
+//! LongMemEval-S, so production recall numbers transfer. The `RecallConfig`
+//! struct exposes the knobs the eval harness varies for ablation; callers
+//! who don't care use `RecallConfig::default()`.
 
 pub mod expand;
 pub mod rrf;
 pub mod diversify;
 pub mod pipeline;
 
-pub use pipeline::{Recalled, recall};
+pub use pipeline::{Recalled, recall, recall_with_config};
 
-/// RRF constant. Agentmemory uses 60; sticking with it makes our numbers
-/// directly comparable.
-pub const RRF_K: f64 = 60.0;
+/// Which retrieval streams contribute to the fused result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Hybrid,
+    Bm25Only,
+    VectorOnly,
+}
 
-/// How many results we pull from each stream before fusion. Larger numbers
-/// give RRF more material to find dual-stream hits but cost SQL time.
-pub const PER_STREAM_TOP_K: usize = 50;
+/// All recall knobs. Defaults reproduce agentmemory's published config.
+#[derive(Debug, Clone, Copy)]
+pub struct RecallConfig {
+    pub mode: Mode,
+    /// RRF constant. Agentmemory uses 60.
+    pub rrf_k: f64,
+    /// Per-stream top-K cutoff before fusion.
+    pub per_stream_top_k: usize,
+    /// Max results per session in the final ranking. `None` disables diversification.
+    pub diversify_cap: Option<usize>,
+    /// If false, the recall pipeline skips synonym expansion (caller is
+    /// responsible for ensuring the synonyms table is empty if it wants a
+    /// fully clean ablation).
+    pub use_synonyms: bool,
+}
 
-/// Session diversification cap. Matches agentmemory's hardcoded 3.
-pub const MAX_PER_SESSION: usize = 3;
+impl Default for RecallConfig {
+    fn default() -> Self {
+        Self {
+            mode: Mode::Hybrid,
+            rrf_k: 60.0,
+            per_stream_top_k: 50,
+            diversify_cap: Some(3),
+            use_synonyms: true,
+        }
+    }
+}

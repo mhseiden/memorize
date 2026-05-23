@@ -1,297 +1,249 @@
-# memorize — remaining phases
+# memorize — session memory + code index
 
-What's already shipped (Phases 1–3 + MCP):
+Two MCP tools, one process, one DuckDB.
 
-- DuckDB-backed observation log with BM25 + MiniLM (384d) vector hybrid, RRF
-  (k=60), session diversification (max 3/session), SQL-table-backed synonym
-  expansion.
-- 6 Claude Code hook stubs in `~/.claude/hooks/memorize-*.sh`,
-  `~/.claude/settings.json` merged preserving prior entries.
-- MCP stdio server at `memorize mcp` exposing `memory_recall` and
-  `memory_save`, registered in `~/.claude.json`. Tool descriptions adopted
-  verbatim from agentmemory.
-- `~/Vibes/memorize/README.md` narrates the observation lifecycle.
+- `session_recall(query, limit?)` — searches the user/assistant conversation
+  corpus. Hybrid BM25 + per-chunk vector with RRF fusion. Returns prose
+  observations (prompts, assistant messages, subagent results) plus compact
+  references to files/lines touched during prior sessions.
+- `code_recall(query, limit?, language?, path_prefix?)` — searches the
+  local code index. AST-chunked via tree-sitter (cAST-style), hybrid BM25 +
+  vector over function/class/block-level chunks, returns
+  `{path, line_start, line_end, qualified, body}` per hit.
 
-This file covers what's left.
-
----
-
-## Validation gate (before Phase 4)
-
-Confirm the MCP tools self-trigger in real sessions. Open a fresh Claude
-Code session in a repo with prior memorize captures and ask a question that
-references prior work — "explain how the IR memo works", "what did we
-decide about X", etc.
-
-- If the model calls `memory_recall` on its own → MCP descriptions work as
-  is, proceed to Phase 4.
-- If it still defaults to Explore → the agentmemory-style descriptions
-  aren't enough. Tune (more directive wording or keep the CLAUDE.md hint).
-  Re-test before Phase 4.
-
-This isn't a coding phase, just a checkpoint. Do not start Phase 4 until
-the model proactively reaches for memory at least once per session on
-prior-work prompts.
+The agent decides which tool to reach for based on the query — we don't merge
+them into one unified call. The cost asymmetry (session = cheap text, code
+= structured local index that updates on file save) is something the agent
+can reason about.
 
 ---
 
-## Phase 4 — eval harness (LongMemEval parity)
+## What's already shipped
 
-Goal: reproducible quality measurement against the same dataset agentmemory
-uses, with comparable outputs that let us tune knobs. Lives in
-`crates/memorize-eval/`.
+- Phase 1–3 of the original plan: hooks, MCP, hybrid retrieval (RRF k=60,
+  session diversification, SQL-table synonyms), CPU-only embedding via
+  `fastembed` + MiniLM-L6-v2 (384-d, 512-token context). On LongMemEval-S
+  this scores R@5 = 0.964 with hybrid mode, beating agentmemory's published
+  0.952.
+- Embedding cache for eval iteration speed.
+- CoreML investigation concluded: documented architectural mismatch for
+  small encoders + dynamic batches; CPU is the right path. Wiring left
+  behind `MEMORIZE_EMBED_COREML=1` env var for future tinkering on bigger
+  models.
 
-### Dataset
+## What's changing
 
-Download `longmemeval_s_cleaned.json` (~264MB, 500 questions, ~48 sessions
-each) from `xiaowu0162/longmemeval-cleaned` on HuggingFace into
-`crates/memorize-eval/data/`. Gate on file presence — skip if already
-downloaded.
+### 1. Session capture refactor (Phase A)
 
-### Per-question harness
+Today every `PostToolUse` hook stores a 4KB-truncated dump of tool I/O.
+Most of that is garbage (file contents we already have on disk, bash
+output the model could re-run). The corpus is noisier than it needs to be
+and that drags down both BM25 signal-to-noise and the value of recall.
 
-For each question:
+New shape:
 
-1. Open a `:memory:` DuckDB via `memorize-store` (fresh ephemeral index).
-2. Insert each of the question's ~48 session chunks as one obs row (raw
-   text → `body`, embed → `emb`).
-3. Run the question text through `memorize-recall::recall` exactly as
-   production code does — no shortcuts.
-4. Record: ranked list of obs ids, gold session match position, wall-clock
-   latency.
+| capture | stored as |
+|---|---|
+| `UserPromptSubmit` | full prose, `kind='user_prompt'` |
+| `Stop` (extracted `last_assistant_message`) | full prose, `kind='assistant_message'` |
+| `SubagentStop` | full prose, `kind='subagent_message'` |
+| `PostToolUse` for `Read` | `Read(<path>:<lines>)` — path + line range only |
+| `PostToolUse` for `Edit` | `Edit(<path>:<lines> → <intent>)` — path + range + first 80 chars from surrounding prompt as intent |
+| `PostToolUse` for `Write` | `Write(<path>, <N> lines, created\|overwritten)` |
+| `PostToolUse` for `Bash` | `Bash($ <cmd>, exit=<n>, <t>s)` — command + exit code + duration only |
+| `PostToolUse` for `Grep`/`Glob` | skipped |
+| `PostToolUse` for `WebFetch` | `WebFetch(<url>) → <status>` |
+| `Task` (subagent spawn) | `Task(<type>, "<first 80 chars of prompt>")` |
 
-### Metrics
+**No tool output content is stored.** The session index becomes a record of
+intent (prose) and pointers (refs). The agent dereferences refs via
+`code_recall` or its own `Read` tool when it actually needs to see code.
 
-Mirror agentmemory's `benchmark/lib/` calculations:
-
-- `recall_any@K` for K ∈ {5, 10, 20} — does *any* gold session appear in top-K?
-- NDCG@10
-- MRR (first-relevant position)
-- Precision@5
-- All aggregated overall + by question category: `knowledge-update`,
-  `multi-session`, `temporal-reasoning`, `single-session-user`,
-  `single-session-assistant`, `single-session-preference`.
-
-### Knobs (ablation surface)
-
-| Flag | Default | Purpose |
-|---|---|---|
-| `--mode {bm25-only, vector-only, hybrid}` | `hybrid` | Isolate per-stream contribution |
-| `--rrf-k <N>` | 60 | Vary RRF constant |
-| `--top-k <N>` | 50 | Per-stream cutoff |
-| `--diversify on|off` | `on` | Toggle session diversification |
-| `--diversify-cap <N>` | 3 | Adjust per-session cap |
-| `--synonyms on|off` | `on` | Measure synonym contribution |
-| `--limit <N>` | 500 | Sample N questions for iteration speed |
-
-### Outputs
-
-Three artifacts per run, into `--out <dir>`:
-
-- `report.md` — markdown table with overall + by-category rows. Configuration hash + git SHA in header so reports are attributable.
-- `report.json` — per-question raw records (question_id, category, ranks of gold sessions, scores, latency). Slice externally without re-running.
-- `summary.csv` — one line per run. Sticks into a tracking spreadsheet over time.
-
-### Acceptance (calibration, not pass/fail)
-
-| Mode | Target | Agentmemory's published |
-|---|---|---|
-| BM25-only | ≥ 85% R@5 | 86.2% |
-| Hybrid | ≥ 94% R@5 | 95.2% |
-
-If we land more than 2pp below either, something is wrong with tokenization
-or synonyms — investigate before declaring Phase 4 complete.
-
-### File layout
-
-```
-crates/memorize-eval/
-├── Cargo.toml                  # depends on memorize-recall + memorize-store
-├── data/.gitignore             # 264MB dataset not committed
-└── src/
-    ├── main.rs                 # produces `memorize-eval` binary
-    ├── dataset.rs              # HuggingFace fetch + JSON parse
-    ├── metrics.rs              # R@K, NDCG, MRR, Precision
-    └── report.rs               # markdown/json/csv emitters
-```
-
-### Verification
-
-`memorize-eval run --mode hybrid --limit 50 --out /tmp/r1/` produces
-`report.md` with R@5 within 2pp of 95.2%. Re-run with `--mode bm25-only`
-should drop to within 2pp of 86.2%. `--synonyms off` should produce a
-measurable drop (1–4pp expected based on agentmemory's design).
-
----
-
-## Phase 5 — optional LLM compression (opt-in)
-
-Goal: enable raw-vs-summary A/B by populating compressed summaries for every
-observation. Strictly additive to the working Phase-3 system. Default off.
-
-### Schema migration
-
-Idempotent on startup. Add columns and the second FTS index — none exist
-pre-Phase-5:
+Schema extension on `obs`:
 
 ```sql
-ALTER TABLE obs ADD COLUMN IF NOT EXISTS compressed_at BIGINT;
-ALTER TABLE obs ADD COLUMN IF NOT EXISTS summary VARCHAR;
-ALTER TABLE obs ADD COLUMN IF NOT EXISTS title VARCHAR;
-ALTER TABLE obs ADD COLUMN IF NOT EXISTS concepts VARCHAR[];
-ALTER TABLE obs ADD COLUMN IF NOT EXISTS facts VARCHAR[];
-ALTER TABLE vec ADD COLUMN IF NOT EXISTS emb_summary FLOAT[384];
-PRAGMA create_fts_index('obs','id','summary', overwrite=1);
+ALTER TABLE obs ADD COLUMN IF NOT EXISTS ref_path VARCHAR;
+ALTER TABLE obs ADD COLUMN IF NOT EXISTS ref_line_start INTEGER;
+ALTER TABLE obs ADD COLUMN IF NOT EXISTS ref_line_end INTEGER;
 ```
 
-### LLM client (`crates/memorize-llm/`)
+Populated for tool-use obs, NULL for prose obs. Lets us filter recall by
+file path cheaply (`WHERE ref_path LIKE 'crates/foo/%'`) without parsing body
+strings.
 
-Single function: `compress_one(raw: &str) -> Result<Compressed>`. POST to
-`https://api.anthropic.com/v1/messages` (configurable via
-`ANTHROPIC_BASE_URL`) with:
+### 2. Multi-chunk vectors for sessions (Phase A)
 
-- Headers: `x-api-key: $ANTHROPIC_API_KEY`, `anthropic-version: 2023-06-01`,
-  `content-type: application/json`.
-- Body:
-  ```json
-  {
-    "model": "claude-haiku-4-5",
-    "max_tokens": 1024,
-    "system": [
-      {"type": "text", "text": "<compression instructions>",
-       "cache_control": {"type": "ephemeral"}}
-    ],
-    "tools": [{
-      "name": "submit_compression",
-      "description": "Submit the compressed observation",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "title":    {"type": "string"},
-          "summary":  {"type": "string"},
-          "concepts": {"type": "array", "items": {"type": "string"}},
-          "facts":    {"type": "array", "items": {"type": "string"}}
-        },
-        "required": ["title","summary","concepts","facts"]
-      }
-    }],
-    "tool_choice": {"type": "tool", "name": "submit_compression"},
-    "messages": [{"role": "user", "content": "<raw obs body>"}]
-  }
-  ```
+Today: one embedding per obs. fastembed truncates inputs over 512 tokens
+silently — for long assistant messages and subagent outputs, the head is
+embedded and the tail is lost.
 
-Response parsing: find the `tool_use` block in `content[]`, deserialize
-`input` into the `Compressed` struct. No fragile JSON-in-text parsing.
+New: char-windowed chunks (~1800 chars each, no overlap), one vector per
+chunk, stored in a new `vec_chunks` table:
 
-Prompt caching via `cache_control: ephemeral` on the system prompt — every
-observation in a `memorize compress` batch hits the cache after the first
-call, cutting cost ~10× on system-prompt tokens.
-
-Plain `ureq` blocking. No streaming, no async. ~80 lines.
-
-### CLI
-
-```
-memorize compress [--limit N]
+```sql
+CREATE TABLE vec_chunks (
+    obs_id    BIGINT NOT NULL,
+    chunk_idx INTEGER NOT NULL,
+    emb       FLOAT[384] NOT NULL,
+    PRIMARY KEY (obs_id, chunk_idx)
+);
 ```
 
-- Checks `ANTHROPIC_API_KEY` is set; if not, prints `compression disabled`
-  and exits 0.
-- `SELECT id, body FROM obs WHERE compressed_at IS NULL ORDER BY ts ASC LIMIT N`
-  (default N=100).
-- For each row: call LLM, parse tool_use, UPDATE obs set
-  summary/title/concepts/facts/compressed_at, embed summary into
-  `vec.emb_summary`.
-- Rebuild `summary` FTS index after batch.
-- Progress: `compressed N/M (elapsed Xs)`.
+Retrieval: cosine against every chunk, group by `obs_id`, take
+`max(score)` per obs as the vector contribution. RRF fusion with BM25 is
+unchanged.
 
-Also exposed as `POST /compress?limit=N` for cron-style invocation.
+BM25 indexing is unchanged — DuckDB FTS handles full body length without
+truncation. We get full-body BM25 + chunked-vector recall.
 
-### Recall mode switch
+### 3. Code index (Phase B)
 
-`/recall` gains optional `search_mode ∈ {"raw","summary"}` (default `"raw"`).
+New crate `memorize-code`. Tree-sitter via per-language Rust bindings.
+cAST-style chunking: walk AST, emit chunks at function/class/method
+boundaries. Oversized nodes recursively split; small siblings greedy-merge
+up to ~1800 char budget.
 
-`summary` mode gated on 100% coverage:
-`SELECT COUNT(*) FROM obs WHERE compressed_at IS NULL` must be 0. Otherwise
-return HTTP 409 with the uncompressed count and instructions to run
-`memorize compress`. When coverage is 100%, recall pipeline runs against
-`summary`-column FTS + `emb_summary` vectors instead of `body` + `emb`.
+Languages at v1: Rust, TypeScript/JavaScript, Python, Go, Bash. Adding a
+language = one Cargo line + one parser registration.
 
-### Status extension
+Storage in the same DuckDB:
 
-`memorize status` shows compression coverage as `X/Y compressed`.
+```sql
+CREATE TABLE files (
+    path       VARCHAR PRIMARY KEY,
+    repo_root  VARCHAR NOT NULL,
+    language   VARCHAR,
+    mtime_ns   BIGINT NOT NULL,
+    size_bytes BIGINT NOT NULL,
+    git_rev    VARCHAR
+);
 
-### Config additions
+CREATE TABLE code_chunks (
+    id         BIGINT PRIMARY KEY,
+    path       VARCHAR NOT NULL REFERENCES files(path),
+    line_start INTEGER NOT NULL,
+    line_end   INTEGER NOT NULL,
+    kind       VARCHAR,
+    qualified  VARCHAR,
+    body       VARCHAR NOT NULL,
+    body_hash  BLOB
+);
 
-- `anthropic_api_key`
-- `anthropic_model` (default `claude-haiku-4-5`)
-- `anthropic_base_url` (optional, for local proxies)
-- `compress_batch_size` (default 100)
+CREATE TABLE vec_code (
+    id  BIGINT PRIMARY KEY,
+    emb FLOAT[384]
+);
 
-### Crate layout
-
+PRAGMA create_fts_index('code_chunks', 'id', 'body');
+PRAGMA create_fts_index('code_chunks', 'id', 'qualified');
 ```
-crates/memorize-llm/src/
-├── lib.rs
-├── client.rs          # Anthropic /v1/messages POST
-├── compress.rs        # batch loop, schema validation, DB updates
-└── prompt.rs          # compression system prompt
+
+Watcher pipeline:
+
+1. `notify` (Rust crate) watches configured roots (`~/Repos`, `~/Vibes` by
+   default), with debouncing (200ms).
+2. On modify/create: read file, detect language by extension, parse +
+   chunk, hash each chunk's body, upsert any new or changed chunks, embed
+   only the changed ones.
+3. On delete/rename: remove all `code_chunks` for that path.
+4. Cold-start: walk configured roots once on `memorize serve` startup,
+   indexing anything not already present. Background thread; doesn't
+   block the HTTP server.
+
+Excludes (path-glob, fnmatch-style, configurable):
+```
+target, node_modules, .git, dist, build,
+.env*, *.pem, *.key, secrets/, .aws/
 ```
 
-Plus extensions in:
-- `crates/memorize-store/src/migrations.rs` — ALTER TABLE block
-- `crates/memorize-cli/src/compress.rs` — CLI dispatch
+Privacy: paths in the include set are indexed in full. Anything matching
+an exclude pattern never enters `code_chunks`.
 
-### Verification
+### 4. MCP surface (Phase C)
 
-With `ANTHROPIC_API_KEY` set, `memorize compress --limit 10` populates ten
-rows; `memorize status` shows `10/N compressed`. Once `N/N compressed`,
-`recall --search-mode summary` returns results. Phase-4 eval harness re-runs
-against summary indexing for a directly comparable R@5/R@10. Prompt-cache
-hits visible in `usage.cache_read_input_tokens` on the API response.
+Drop `memory_recall` and `memory_save`. Replace with two distinct tools:
+
+```text
+session_recall(query, limit?)
+  Search prior session memory (user prompts, assistant messages, subagent
+  results, and compact tool references) for relevant context. Use when
+  the user's question references prior work, decisions, or things "we"
+  did — before exploring from scratch.
+
+code_recall(query, limit?, language?, path_prefix?)
+  Search the indexed local codebase for semantically relevant functions,
+  classes, or code blocks. AST-chunked via tree-sitter, hybrid BM25 +
+  vector. Returns {path, line_start, line_end, qualified, body}. Use when
+  you need to find where something is defined or how a concept is
+  implemented across the codebase.
+```
+
+The agent decides. Session recall is cheap (small corpus, often <10ms).
+Code recall is local-fast (DuckDB FTS + brute-force cosine over a few
+thousand chunks).
 
 ---
 
-## Phase 6 — deferred / revisit gates
+## What's NOT in this plan
 
-Only revisit if dogfooding turns up the missing capability:
+- LLM-assisted compression (Phase 5 in the prior plan). Deferred until we
+  see real signal-to-noise issues on the new corpus shape.
+- Eval harness changes. The harness still runs against LongMemEval-S
+  unchanged; it doesn't exercise the new tool-ref capture (the dataset has
+  no tool calls) or the code index. Both new features will be measured by
+  dogfooding, not by LongMemEval.
+- LSIF/SCIP precise code intelligence. Out of scope.
+- Cross-language symbol graph (Glean-style). Out of scope.
+- "Intent extraction" via LLM for Edit references — today the intent
+  string comes from surrounding prompt text; LLM is deferred.
+- HNSW vector index. Brute-force cosine is fine until the corpora cross
+  ~50k vectors total.
 
-### JSONL replay
+---
 
-Seed memorize from existing `~/.claude/projects/*/conversations/*.jsonl`
-history. One-time bulk import; useful when starting on a new machine or
-recovering after a DB reset.
+## Implementation phases
 
-```
-memorize replay [--from <dir>] [--limit N] [--dry-run]
-```
+### Phase A: Session refactor (sequential)
 
-Parses Claude Code's JSONL transcript format, materializes each turn as
-synthetic obs rows (user_prompt, tool_use, etc.) into the existing tables.
-Reuses the production privacy filter and dedup.
+1. **Capture refactor** (`memorize-cli/src/capture.rs`): rewrite per-tool
+   handlers to emit compact ref-only bodies. Populate `ref_path` /
+   `ref_line_start` / `ref_line_end` for tool obs.
+2. **Multi-chunk vectors** (`memorize-store`, `memorize-recall`): drop
+   `vec` schema, add `vec_chunks`. Update insert (chunk body, embed each)
+   and search (group-by-obs max). Tests reflect new shape.
+3. **MCP rename**: `memory_recall` → `session_recall`. Drop `memory_save`
+   (kept implicitly by capturing user prompts). Update CLAUDE.md hint.
 
-### HNSW vector index
+### Phase B: Code index (sequential)
 
-Trigger: corpus passes ~50k observations and brute-force cosine starts
-showing in recall latency (>100ms p95).
+1. **`memorize-code` crate**: tree-sitter dep + per-language registrations.
+   `chunk_file(path) -> Vec<CodeChunk>` exported.
+2. **Schema** (`memorize-store`): `files`, `code_chunks`, `vec_code`,
+   indexes.
+3. **Indexer + watcher**: `notify::Watcher` driven background thread.
+   Cold-start scan. Incremental updates on file events.
+4. **HTTP routes** (`memorize-server`): `POST /code/search`,
+   `GET /code/at?path&line`.
+5. **MCP tool** (`memorize-mcp`): `code_recall` registered alongside
+   `session_recall`.
 
-DuckDB VSS extension is the path of least resistance:
+### Phase C: Build + install + dogfood
 
-```sql
-INSTALL vss; LOAD vss;
-CREATE INDEX vec_hnsw ON vec USING HNSW (emb) WITH (metric = 'cosine');
-```
+1. `cargo build --release`. Single binary at `~/.local/bin/memorize`.
+2. `memorize install-hooks` refreshed: same 6 hook stubs (the capture-side
+   refactor changes what they emit, not what fires).
+3. Restart `memorize serve`. Cold-scan begins on the configured roots.
+4. Smoke: trigger a few real Claude Code turns, confirm new obs shape;
+   `code_recall "fastembed"` (or similar) returns hits from this very
+   repo.
 
-Recall pipeline uses the index automatically once present; no API change.
-Adds a per-startup `INSTALL vss; LOAD vss;` (downloads ~10MB on first run).
+### What I'd track during dogfood
 
-### Other items intentionally not planned
+- Does the agent reach for `session_recall` and `code_recall` proactively?
+- Is BM25 noticeably cleaner now that file dumps aren't in the corpus?
+- Does `code_recall` actually surface useful chunks, or does the model
+  prefer to `Grep` like it does today?
 
-- LLM provider abstraction (we shipped Anthropic-only by design)
-- Knowledge graph extraction (benchmark shows it regresses on internal data)
-- 4-tier consolidation (brain-analogy theater; the table is the tier)
-- Viewer UI (DuckDB CLI is sufficient for one user)
-- Mesh sync / team memory (single user)
-- Snapshots / audit / governance (DuckDB file is the artifact; `cp` is the backup story)
-- Embedding providers beyond local MiniLM (the model is fine at this scale)
-- iii runtime (replaced by tiny_http + std::sync::Mutex, intentionally)
+If `code_recall` isn't getting called, the next experiment is tuning the
+tool description rather than the indexing — same posture as the agentmemory
+descriptions we adopted earlier.

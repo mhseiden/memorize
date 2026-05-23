@@ -8,6 +8,8 @@ members = [
     "crates/memorize-server",
     "crates/memorize-mcp",
     "crates/memorize-cli",
+    "crates/memorize-eval",
+    "crates/memorize-code",
 ]
 
 [workspace.package]
@@ -22,6 +24,7 @@ memorize-embed = { path = "crates/memorize-embed" }
 memorize-recall = { path = "crates/memorize-recall" }
 memorize-server = { path = "crates/memorize-server" }
 memorize-mcp = { path = "crates/memorize-mcp" }
+memorize-code = { path = "crates/memorize-code" }
 
 anyhow = "1"
 thiserror = "2"
@@ -33,7 +36,12 @@ regex = "1"
 clap = { version = "4.5", features = ["derive"] }
 duckdb = "1.5"
 tiny_http = "0.12"
-fastembed = "4"
+fastembed = "5.13"
+# Pinned to fastembed 5.13.x's ort version so cargo dedupes to one build.
+# `coreml` feature wires the Apple Neural Engine execution provider; the
+# rc.12 binding (unlike rc.9) exposes the modern MLProgram backend that
+# actually compiles transformer graphs cleanly on macOS 14+.
+ort = { version = "=2.0.0-rc.12", features = ["ndarray", "coreml"], default-features = false }
 ureq = { version = "2", features = ["json"] }
 
 [profile.release]
