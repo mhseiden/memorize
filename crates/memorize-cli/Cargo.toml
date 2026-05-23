@@ -1,0 +1,23 @@
+[package]
+name = "memorize-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "memorize"
+path = "src/main.rs"
+
+[dependencies]
+memorize-core = { workspace = true }
+memorize-store = { workspace = true }
+memorize-embed = { workspace = true }
+memorize-recall = { workspace = true }
+memorize-server = { workspace = true }
+memorize-mcp = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ureq = { workspace = true }
+chrono = { workspace = true }

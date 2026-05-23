@@ -1,0 +1,9 @@
+[package]
+name = "memorize-embed"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+fastembed = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/memorize-core",
+    "crates/memorize-store",
+    "crates/memorize-embed",
+    "crates/memorize-recall",
+    "crates/memorize-server",
+    "crates/memorize-mcp",
+    "crates/memorize-cli",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+[workspace.dependencies]
+memorize-core = { path = "crates/memorize-core" }
+memorize-store = { path = "crates/memorize-store" }
+memorize-embed = { path = "crates/memorize-embed" }
+memorize-recall = { path = "crates/memorize-recall" }
+memorize-server = { path = "crates/memorize-server" }
+memorize-mcp = { path = "crates/memorize-mcp" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+sha2 = "0.10"
+regex = "1"
+clap = { version = "4.5", features = ["derive"] }
+duckdb = "1.5"
+tiny_http = "0.12"
+fastembed = "4"
+ureq = { version = "2", features = ["json"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

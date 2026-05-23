@@ -1,0 +1,6 @@
+# DuckDB is dynamic-linked against the Homebrew install (brew install duckdb).
+# Setting these here means plain `cargo build` works without env-var
+# gymnastics. If you move off macOS/Homebrew, override per-shell.
+[env]
+DUCKDB_LIB_DIR = "/opt/homebrew/lib"
+DUCKDB_INCLUDE_DIR = "/opt/homebrew/opt/duckdb/include"

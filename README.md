@@ -1,0 +1,269 @@
+# memorize
+
+A personal memory layer for Claude Code. Stripped-down Rust port of
+[agentmemory](https://github.com/rohitg00/agentmemory), built around the
+parts that actually move the needle on recall (BM25 + vector + synonyms + RRF
++ session diversification) and nothing else.
+
+Not open-sourced. Not a competitor. Just enough memory that the next session
+remembers what the last one learned.
+
+---
+
+## Architecture in one diagram
+
+```
+                  ┌──────────────────────────────────────────────────────┐
+                  │  Claude Code                                         │
+                  │                                                      │
+   one of nine    │   PostToolUse / UserPromptSubmit / SessionStart /    │
+   hook events ──▶│   Stop / SessionEnd / SubagentStart / SubagentStop / │
+                  │   TaskCompleted / PostToolFailure                    │
+                  └────────────────────────┬─────────────────────────────┘
+                                           │ event JSON on stdin
+                                           ▼
+                          ┌───────────────────────────────────┐
+                          │  memorize capture --hook <name>   │ (small CLI)
+                          └────────────────┬──────────────────┘
+                                           │ HTTP POST /capture
+                                           ▼
+   ┌──────────────────────────────────────────────────────────────────────┐
+   │ memorize serve  (loopback :3111)                                     │
+   │                                                                      │
+   │   privacy regex  →  dedup window  →  fastembed MiniLM-L6-v2  →       │
+   │                                                                      │
+   │                                  ┌───────────────────────────────┐   │
+   │                                  │  DuckDB                       │   │
+   │                                  │   obs (FTS over body)         │   │
+   │                                  │   vec (FLOAT[384] embedding)  │   │
+   │                                  │   synonyms (term, expansion)  │   │
+   │                                  │   sessions                    │   │
+   │                                  └───────────────────────────────┘   │
+   └──────────────────────────────────────────────────────────────────────┘
+                                           ▲
+                                           │  GET /context  /  POST /recall
+                                           │
+                          ┌────────────────┴──────────────────┐
+                          │  next SessionStart hook (passive) │
+                          │  ─── or ───                       │
+                          │  `memorize recall <q>` via Bash   │
+                          └───────────────────────────────────┘
+```
+
+---
+
+## Lifecycle of one observation
+
+Follow a single tool call from emission to expiration:
+
+### 1. Capture
+
+Claude Code runs a `Bash` (or any tool) call. The `PostToolUse` hook fires;
+the stub script in `~/.claude/hooks/post-tool-use.sh` is a one-liner:
+
+```sh
+exec ~/.local/bin/memorize capture --hook post-tool-use
+```
+
+Claude Code pipes the event JSON to its stdin.
+
+### 2. Normalize
+
+`memorize capture` (in `memorize-cli`) parses the Claude-Code-specific JSON
+shape into a canonical `{session, kind, body, branch?}` and POSTs to the
+local server at `http://127.0.0.1:3111/capture`.
+
+### 3. Privacy filter
+
+`memorize-core` runs a `RegexSet` over the body looking for secrets
+(`sk-…`, `ghp_…`, `AKIA…`, `Bearer …`, common `api_key=` assignments).
+Matches are replaced with `[REDACTED]` in place. False positives are harmless;
+false negatives could leak secrets, so the regexes lean conservative.
+
+### 4. Truncate
+
+Tool outputs (a `Read` of a 5KB file, a long `Bash` stdout) get clipped to
+4KB plus an `…[truncated]` marker. Caps storage growth and keeps single
+observations from dominating recall.
+
+### 5. Dedup
+
+SHA-256 hash over `(session ‖ kind ‖ body[..500])` keyed against an in-memory
+`HashMap`. Identical hashes within a 5-minute window are dropped. Catches
+hook retries and double-emits without storing the duplicate.
+
+### 6. Embed
+
+The body is sent through `memorize-embed`, which is a `OnceLock`-protected
+singleton wrapper around `fastembed::TextEmbedding` (MiniLM-L6-v2, 384
+dimensions). First call downloads the ONNX model (~90MB) to
+`~/.memorize/models/`; subsequent calls reuse the in-process model.
+
+### 7. Persist
+
+One `INSERT` into `obs(id, ts, session, branch, kind, body)`, one `INSERT`
+into `vec(id, emb)`. Two rows, one transaction-implied unit of work.
+
+### 8. Sit at rest
+
+The row lives in `~/.memorize/db.duckdb`. No background consolidation, no
+LLM rewrite pass, no 4-tier memory ladder. The raw observation is the canonical
+form.
+
+### 9. Recall (next session)
+
+When the next session starts, Claude Code fires the `SessionStart` hook. The
+stub script calls `memorize capture --hook session-start`, which records the
+session, then issues `GET /context?session=…&budget=2000`. The server runs:
+
+1. **Synonym expansion** — tokenize the query; for each token, look up
+   expansions via SQL subquery against the `synonyms` table.
+   `k8s` → `[k8s, kubernetes, kube]`.
+2. **BM25** — DuckDB FTS `match_bm25` over `obs.body` using the expanded
+   token bag. Top-50 by score.
+3. **Vector** — `array_cosine_similarity(emb, <query embedding>)` over `vec`.
+   Top-50 by cosine.
+4. **RRF fusion** — `score(d) = 1/(60 + bm25_rank) + 1/(60 + vec_rank)` over
+   the union of both rankings. Same k=60 agentmemory uses on LongMemEval-S.
+5. **Session diversification** — at most 3 results per session in the final
+   ranking, with deferred fill if diversification thins the result set.
+6. **Token budget** — render as markdown, truncate when total chars exceed
+   `budget × 4` (≈ token estimate).
+
+The markdown blob is returned via the hook's stdout, where Claude Code
+injects it into the new conversation as system context. The agent never
+explicitly asks; the memory just shows up at message #1.
+
+Claude can also call `memorize recall "<query>"` mid-session via the Bash
+tool — the CLI hits `/recall` directly. A line in `~/.claude/CLAUDE.md`
+installed by `memorize install-hooks` reminds the model the tool exists.
+
+### 10. Expire
+
+On every `memorize serve` startup, the server runs
+`DELETE FROM obs WHERE ts < (now - 90d)` and cleans orphaned `vec` rows.
+Configurable via `MEMORIZE_TTL_DAYS`. There's no undo; the assumption is
+that 90-day-old tool outputs aren't going to drive recall anyway.
+
+---
+
+## Schema
+
+```sql
+CREATE TABLE obs (              -- one row per captured observation
+    id      BIGINT PRIMARY KEY,
+    ts      BIGINT NOT NULL,    -- unix seconds
+    session VARCHAR NOT NULL,
+    branch  VARCHAR,            -- git branch at capture time
+    kind    VARCHAR NOT NULL,   -- 'user_prompt', 'tool_use', etc.
+    body    VARCHAR NOT NULL    -- privacy-filtered, ≤4KB
+);
+
+CREATE TABLE sessions (         -- one row per Claude Code session
+    id         VARCHAR PRIMARY KEY,
+    started_ts BIGINT,
+    ended_ts   BIGINT,
+    branch     VARCHAR,
+    cwd        VARCHAR,
+    summary    VARCHAR
+);
+
+CREATE TABLE vec (              -- 1:1 with obs.id
+    id  BIGINT PRIMARY KEY,
+    emb FLOAT[384]              -- MiniLM-L6-v2
+);
+
+CREATE TABLE synonyms (         -- bidirectional pairs
+    term      VARCHAR NOT NULL,
+    expansion VARCHAR NOT NULL,
+    PRIMARY KEY (term, expansion)
+);
+
+CREATE TABLE meta (             -- internal bookkeeping (seeded flag, etc.)
+    key   VARCHAR PRIMARY KEY,
+    value VARCHAR NOT NULL
+);
+
+PRAGMA create_fts_index('obs', 'id', 'body');
+```
+
+---
+
+## Configuration
+
+| Variable                  | Default                  | Purpose                          |
+|---------------------------|--------------------------|----------------------------------|
+| `MEMORIZE_PORT`           | `3111`                   | HTTP listen port                 |
+| `MEMORIZE_DB_PATH`        | `~/.memorize/db.duckdb`  | DuckDB file location             |
+| `MEMORIZE_TOKEN_BUDGET`   | `2000`                   | Default `/context` token cap     |
+| `MEMORIZE_TTL_DAYS`       | `90`                     | Eviction threshold               |
+| `MEMORIZE_MODEL_DIR`      | `~/.memorize/models`     | ONNX cache                       |
+| `MEMORIZE_VERBOSE`        | _unset_                  | Verbose server logging           |
+
+---
+
+## CLI quick reference
+
+| Command                          | What it does                                                 |
+|----------------------------------|--------------------------------------------------------------|
+| `memorize serve`                 | Run the HTTP server in the foreground                        |
+| `memorize capture --hook <name>` | Read a hook event from stdin and POST it to the server       |
+| `memorize recall "<query>"`      | Search prior observations (pretty-printed JSON to stdout)    |
+| `memorize remember "<text>"`     | Save an arbitrary string as a `manual` observation           |
+| `memorize syn …`                 | Manage the synonyms table (Phase 3)                          |
+| `memorize install-hooks`         | Write hook stubs into `~/.claude/hooks/` (Phase 2)           |
+| `memorize status`                | Print server liveness, DB size, configured paths             |
+
+For backups and ad-hoc inspection, just use DuckDB directly:
+
+```sh
+cp ~/.memorize/db.duckdb backup.duckdb         # backup
+duckdb ~/.memorize/db.duckdb                   # interactive SQL
+```
+
+---
+
+## How an agent uses this (without MCP)
+
+Two channels, no MCP shim required:
+
+1. **Passive injection at SessionStart.** The hook returns markdown that
+   Claude Code injects as system context. Free attention, no tool call.
+2. **Active query via the Bash tool.** Claude runs `memorize recall <query>`
+   when it wants to look something up. A one-line CLAUDE.md hint
+   (installed by `memorize install-hooks`) tells the model this is
+   available.
+
+If active recall becomes a frequent pattern and shelling-out feels clumsy,
+an MCP shim is a small follow-up — `memorize serve` already exposes
+`/recall` over HTTP, so the shim would just translate stdio MCP frames.
+
+---
+
+## Differences vs agentmemory
+
+Intentionally cut from the upstream design:
+
+- **LLM compression** (the "consolidation pipeline", graph extraction,
+  reflection, lessons) — agentmemory's published 95.2% R@5 on LongMemEval-S
+  is on **raw observations**, no LLM in the loop. We drop the whole tier
+  system and store raw bodies. (Optional batch compression slated for a
+  later phase.)
+- **Knowledge graph** — agentmemory's own internal benchmark shows the graph
+  stream *subtracts* from R@5 vs dual-stream. Not worth ~16k lines of code.
+- **4-tier memory hierarchy** (working/episodic/semantic/procedural) —
+  brain-analogy theater. We use one table.
+- **MCP server** — see above; Bash + SessionStart injection covers our use
+  cases.
+- **Viewer, mesh sync, team memory, audit trail, citation provenance,
+  Obsidian export, etc.** — single-user tool; none of these earn their cost.
+- **iii runtime** — replaced by plain `tiny_http` + `std::sync::Mutex` +
+  `duckdb`. Three deps instead of a worker-pool engine.
+
+Kept because the LongMemEval-S benchmark proves they matter:
+
+- BM25 with stemming (DuckDB FTS, Snowball English)
+- MiniLM-L6-v2 cosine via `fastembed`
+- RRF fusion (k=60, agentmemory's published config)
+- Session diversification (max 3 per session)
+- Synonym expansion (SQL-table-backed)
