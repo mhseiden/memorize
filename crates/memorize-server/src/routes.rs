@@ -268,11 +268,11 @@ fn handle_status(state: &ServerState, req: Request) -> Result<()> {
 fn handle_code_search(state: &ServerState, req: Request, payload: CodeSearchReq) -> Result<()> {
     let _ = state.store.rebuild_fts();
     let q = payload.query.trim();
-    let scope_arg = payload.scope.as_deref().unwrap_or("auto");
+    let scope_arg = payload.scope.as_deref().unwrap_or("current");
 
     // Resolve the effective path filter + any user-facing warnings.
-    // Explicit `path` from the agent overrides cwd-based auto-scope.
-    let (mut effective_prefix, mut warnings, fall_back_allowed) = resolve_scope(
+    // Explicit `path` overrides cwd-derived scope; `scope=all` ignores cwd.
+    let (effective_prefix, warnings) = resolve_scope(
         state,
         payload.cwd.as_deref(),
         payload.path.as_deref(),
@@ -289,30 +289,10 @@ fn handle_code_search(state: &ServerState, req: Request, payload: CodeSearchReq)
     let limit = payload.limit.unwrap_or(10);
     let per_stream = 50usize;
     let lang = payload.language.as_deref();
-    let mut prefix = effective_prefix.as_deref();
+    let prefix = effective_prefix.as_deref();
 
     let q_emb = memorize_embed::embed(q).context("embed code query")?;
-
     let mut fused = fused_code_search(state, q, &q_emb, per_stream, lang, prefix);
-
-    // Auto-scope fallback: if we got nothing in the scoped search and the
-    // caller asked for "auto", retry without the prefix and tell them.
-    if fused.is_empty() && fall_back_allowed && prefix.is_some() {
-        fused = fused_code_search(state, q, &q_emb, per_stream, lang, None);
-        if !fused.is_empty() {
-            warnings.push(format!(
-                "No matches under {}. Expanded scope to all indexed roots.",
-                effective_prefix.as_deref().unwrap_or("scope")
-            ));
-        }
-        // No further reads of these — the fallback path reissued the search
-        // already. Clear them so the response shape doesn't carry stale state.
-        let _ = effective_prefix.take();
-        prefix = None;
-    }
-    let _ = prefix; // kept for the fallback decision above; not used after
-    let _ = effective_prefix; // kept for the fallback warning above; not used after
-
     fused.truncate(limit);
     let ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
     let rows = state.store.get_code_chunks_by_ids(&ids)?;
@@ -341,65 +321,72 @@ fn handle_code_search(state: &ServerState, req: Request, payload: CodeSearchReq)
     )
 }
 
+/// Sentinel prefix that no real `code_chunks.path` will match. Used when we
+/// need to deliberately return zero results (cwd or path outside all roots).
+const NEVER_MATCHES: &str = "/dev/null/memorize-never-matches/";
+
 /// Resolve the effective path-prefix filter for a code_recall call, plus any
 /// warnings to surface to the agent.
 ///
-/// Returns `(effective_prefix, warnings, fall_back_allowed)`:
-///  - `effective_prefix`: what the search should filter on. None = no filter.
-///  - `warnings`: human-readable hints for the agent.
-///  - `fall_back_allowed`: in "auto" scope, the search can retry without
-///    a prefix if it yields 0 results. Never true for "current" or "all".
+/// Rules:
+///  - Explicit `path` wins, but it must be under *some* indexed root —
+///    otherwise we deliberately return zero results.
+///  - `scope=all` ignores `cwd` and searches everything.
+///  - Otherwise (`scope=current`, the default): scope to the configured
+///    root containing `cwd`. If `cwd` is missing or outside all roots,
+///    return zero results.
+///
+/// "Zero results" is implemented by setting the prefix to a sentinel path
+/// nothing in the index will ever start with. The caller doesn't need a
+/// special branch.
 fn resolve_scope(
     state: &ServerState,
     cwd: Option<&str>,
     explicit_path: Option<&str>,
     scope: &str,
-) -> (Option<String>, Vec<String>, bool) {
-    // Explicit `path` wins regardless of scope — the agent is asking for
-    // something specific.
-    if let Some(pref) = explicit_path {
-        return (Some(pref.to_string()), Vec::new(), false);
+) -> (Option<String>, Vec<String>) {
+    let roots = resolved_root_paths(state);
+
+    // Explicit path. Must be under some indexed root, else return nothing.
+    if let Some(p) = explicit_path {
+        let p_path = std::path::Path::new(p);
+        let under_a_root = roots.iter().any(|r| p_path.starts_with(r));
+        if under_a_root {
+            return (Some(p.to_string()), Vec::new());
+        }
+        let roots_str: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
+        return (
+            Some(NEVER_MATCHES.to_string()),
+            vec![format!(
+                "path ({p}) is not under any indexed root ({}). Returning no results. Narrow to a path inside an indexed root or add it to `code_index.roots` in ~/.memorize/config.toml.",
+                roots_str.join(", ")
+            )],
+        );
     }
 
-    let roots = resolved_root_paths(state);
+    if scope == "all" {
+        // Agent explicitly asked for cross-root. No cwd check.
+        return (None, Vec::new());
+    }
+
+    // scope == "current" (the default): require cwd to be under some root.
     let cwd_root = cwd
         .filter(|c| !c.is_empty())
         .and_then(|c| {
             let cwd_path = std::path::Path::new(c);
             roots.iter().find(|r| cwd_path.starts_with(r)).cloned()
         });
-
-    let mut warnings = Vec::new();
-    match scope {
-        "all" => (None, warnings, false),
-        "current" => match cwd_root {
-            Some(r) => (Some(r.display().to_string()), warnings, false),
-            None => {
-                let cwd_disp = cwd.unwrap_or("(no cwd)");
-                warnings.push(format!(
-                    "scope=current requested but cwd ({cwd_disp}) is not under any indexed root. Returning no results."
-                ));
-                // Use an impossible prefix so no rows match.
-                (Some("/dev/null/never-matches".to_string()), warnings, false)
-            }
-        },
-        // "auto" or anything unrecognized
-        _ => match cwd_root {
-            Some(r) => (Some(r.display().to_string()), warnings, true),
-            None => {
-                if let Some(c) = cwd {
-                    if !c.is_empty() {
-                        let roots_str: Vec<String> =
-                            roots.iter().map(|p| p.display().to_string()).collect();
-                        warnings.push(format!(
-                            "cwd ({c}) is not under any indexed root ({}). Searching across everything. Add this path to `code_index.roots` in ~/.memorize/config.toml to scope future queries.",
-                            roots_str.join(", ")
-                        ));
-                    }
-                }
-                (None, warnings, false)
-            }
-        },
+    match cwd_root {
+        Some(r) => (Some(r.display().to_string()), Vec::new()),
+        None => {
+            let cwd_disp = cwd.unwrap_or("(no cwd)");
+            let roots_str: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
+            let msg = format!(
+                "cwd ({cwd_disp}) is not under any indexed root ({}). Returning no results. Add this path to `code_index.roots` in ~/.memorize/config.toml, or pass `scope=\"all\"` to search across everything.",
+                roots_str.join(", ")
+            );
+            (Some(NEVER_MATCHES.to_string()), vec![msg])
+        }
     }
 }
 

@@ -153,7 +153,7 @@ fn handle_tools_list() -> Value {
             },
             {
                 "name": "code_recall",
-                "description": "Search the indexed local codebase for semantically relevant functions, classes, or code blocks. AST-chunked via tree-sitter, hybrid BM25 + vector. Returns {path, line_start, line_end, qualified, body}.\n\nAuto-scoped to the repo containing your current working directory. Override with `scope` or `path` if you need to search broader or narrower.",
+                "description": "Search the indexed local codebase for semantically relevant functions, classes, or code blocks. AST-chunked via tree-sitter, hybrid BM25 + vector. Returns {path, line_start, line_end, qualified, body}.\n\nResults are scoped to the indexed root containing your current working directory. If that's not the repo you want to search, pass `scope=\"all\"` (cross-root) or `path` (a specific subtree). If cwd is outside every indexed root, no results are returned — pass `scope=\"all\"` explicitly to broaden.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -171,11 +171,11 @@ fn handle_tools_list() -> Value {
                         },
                         "path": {
                             "type": "string",
-                            "description": "Narrow to files under this path prefix. Overrides `scope`."
+                            "description": "Narrow to files under this path prefix. Must be under an indexed root, or no results are returned."
                         },
                         "scope": {
                             "type": "string",
-                            "description": "auto (default; scope to cwd's repo, fall back to all if 0 results) | current (cwd's repo only, no fallback) | all (every indexed root)"
+                            "description": "current (default) — scope to the indexed root containing cwd; outside-root → empty. all — search every indexed root, ignoring cwd."
                         }
                     },
                     "required": ["query"]
