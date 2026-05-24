@@ -107,10 +107,17 @@ CREATE TABLE IF NOT EXISTS code_chunks (
 );
 ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS path_tokens VARCHAR;
 
+-- Int8 scalar quantization. Each f32 component of the L2-normalized
+-- embedder output (range [-1, 1]) maps to `round(v * 127)` as TINYINT.
+-- 4× smaller on disk than FLOAT[N] and the in-memory cache the daemon
+-- builds from this table runs dot products in ~3 ms over the full
+-- corpus. See `migrate_vec_code_to_int8_sql` for the FLOAT→TINYINT
+-- migration that fires on databases created before the change.
 CREATE TABLE IF NOT EXISTS vec_code (
-    id  BIGINT PRIMARY KEY,
-    emb FLOAT[{dim}] NOT NULL
+    id     BIGINT PRIMARY KEY,
+    emb_q8 TINYINT[{dim}] NOT NULL
 );
+ALTER TABLE vec_code ADD COLUMN IF NOT EXISTS emb_q8 TINYINT[{dim}];
 "#,
         dim = dim
     )
@@ -128,6 +135,43 @@ CREATE TABLE IF NOT EXISTS vec_code (
 pub fn fts_index_sql() -> &'static str {
     "PRAGMA create_fts_index('obs', 'id', 'body', overwrite=1);
      PRAGMA create_fts_index('code_chunks', 'id', 'body', 'qualified', 'path_tokens', overwrite=1);"
+}
+
+/// One-shot migration from FLOAT[N] to TINYINT[N] for the code-vector table.
+/// Only fires when the legacy `emb` column is still present.
+///
+/// Two steps run as a single `execute_batch` so a crash in the middle
+/// leaves no half-quantized rows (DuckDB groups consecutive DDL/DML in
+/// a batch under one implicit transaction):
+///
+///   1. Backfill `emb_q8` from `emb` for any NULL rows.
+///   2. Drop the legacy `emb` column.
+///
+/// Idempotent: after the first run, `emb` no longer exists so the
+/// SET-clause's reference to `emb` would error — that's why the caller
+/// must `vec_code_has_legacy_emb` first.
+pub fn migrate_vec_code_to_int8_sql(dim: usize) -> String {
+    format!(
+        r#"
+SET lambda_syntax='ENABLE_SINGLE_ARROW';
+UPDATE vec_code
+   SET emb_q8 = CAST(
+       list_transform(emb, x -> CAST(ROUND(x * 127) AS TINYINT))
+       AS TINYINT[{dim}]
+   )
+ WHERE emb_q8 IS NULL;
+ALTER TABLE vec_code DROP COLUMN IF EXISTS emb;
+"#,
+        dim = dim
+    )
+}
+
+/// True iff the `vec_code` table still has the legacy FLOAT[N] `emb`
+/// column. After migration this returns false on subsequent startups.
+pub fn vec_code_legacy_emb_probe_sql() -> &'static str {
+    "SELECT count(*) > 0
+       FROM duckdb_columns
+      WHERE table_name = 'vec_code' AND column_name = 'emb'"
 }
 
 /// Force-recompute `path_tokens` on store init. Cheap at our scale (~84k

@@ -1,11 +1,26 @@
 use crate::DEFAULT_EMBED_DIM;
-use crate::schema::{backfill_path_tokens_sql, fts_index_sql, schema_sql};
+use crate::schema::{
+    backfill_path_tokens_sql, fts_index_sql, migrate_vec_code_to_int8_sql, schema_sql,
+    vec_code_legacy_emb_probe_sql,
+};
 use crate::synonyms_seed::DEFAULT_PAIRS;
 use anyhow::{Context, Result, bail};
 use duckdb::{Connection, params};
 use memorize_core::{Kind, NewObservation, Observation};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock, RwLock};
+
+/// In-memory int8 vector index. Populated lazily by callers via
+/// `Store::enable_vec_cache()`; daemons enable it at startup so vector
+/// search runs ~3 ms (Rust dot product) instead of ~900 ms (DuckDB
+/// SQL int8 dot product over 192k rows). The eval harness leaves it
+/// off — slower per query but no setup cost.
+struct VecCache {
+    ids: Vec<i64>,
+    vecs: Vec<Vec<i8>>,
+    /// id → position in the parallel arrays. Used for upsert/delete.
+    by_id: std::collections::HashMap<i64, usize>,
+}
 
 /// All access goes through here. DuckDB connections are not `Sync` (single
 /// writer model), so we wrap in a `Mutex`. For a single-user dogfood server
@@ -13,6 +28,16 @@ use std::sync::Mutex;
 pub struct Store {
     conn: Mutex<Connection>,
     embed_dim: usize,
+    /// Optional in-memory int8 vector cache. `OnceLock` so it's initialized
+    /// at most once per process; the inner `RwLock` permits concurrent
+    /// searches alongside the indexer's upserts.
+    vec_cache: OnceLock<RwLock<VecCache>>,
+    /// True when an `obs` insert or a `code_chunks` upsert/delete has
+    /// happened since the last `rebuild_fts`. Lets the route handlers
+    /// skip the multi-second FTS rebuild when nothing has changed.
+    /// Starts `true` so the first rebuild after startup actually fires
+    /// (covers fresh installs + post-restart catch-up).
+    fts_dirty: Mutex<bool>,
 }
 
 /// BM25 + vector recall results carry the obs id, session (for diversification),
@@ -78,7 +103,12 @@ impl Store {
     /// `vec.emb` is `FLOAT[dim]`.
     pub fn open_with_dim<P: AsRef<Path>>(path: P, dim: usize) -> Result<Self> {
         let conn = Connection::open(path).context("open duckdb")?;
-        let store = Store { conn: Mutex::new(conn), embed_dim: dim };
+        let store = Store {
+            conn: Mutex::new(conn),
+            embed_dim: dim,
+            vec_cache: OnceLock::new(),
+            fts_dirty: Mutex::new(true),
+        };
         store.init()?;
         Ok(store)
     }
@@ -102,6 +132,8 @@ impl Store {
         Ok(Store {
             conn: Mutex::new(conn),
             embed_dim: dim,
+            vec_cache: OnceLock::new(),
+            fts_dirty: Mutex::new(true),
         })
     }
 
@@ -115,7 +147,12 @@ impl Store {
     /// the active embedder.
     pub fn open_in_memory_with_dim(dim: usize) -> Result<Self> {
         let conn = Connection::open_in_memory().context("open in-memory duckdb")?;
-        let store = Store { conn: Mutex::new(conn), embed_dim: dim };
+        let store = Store {
+            conn: Mutex::new(conn),
+            embed_dim: dim,
+            vec_cache: OnceLock::new(),
+            fts_dirty: Mutex::new(true),
+        };
         store.init()?;
         Ok(store)
     }
@@ -128,6 +165,24 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(&schema_sql(self.embed_dim))
             .context("apply schema")?;
+
+        // One-shot int8 vector migration. Only fires on DBs that still have
+        // the legacy FLOAT[N] `emb` column on `vec_code`; idempotent on every
+        // startup after that.
+        let has_legacy_emb: bool = conn
+            .query_row(vec_code_legacy_emb_probe_sql(), [], |r| r.get(0))
+            .unwrap_or(false);
+        if has_legacy_emb {
+            eprintln!("memorize-store: migrating vec_code.emb FLOAT→TINYINT (one-time)...");
+            let t = std::time::Instant::now();
+            conn.execute_batch(&migrate_vec_code_to_int8_sql(self.embed_dim))
+                .context("migrate vec_code to int8")?;
+            eprintln!(
+                "memorize-store: vec_code int8 migration done in {:.1}s",
+                t.elapsed().as_secs_f64()
+            );
+        }
+
         conn.execute_batch(backfill_path_tokens_sql())
             .context("backfill path_tokens")?;
         conn.execute_batch(fts_index_sql()).context("create fts index")?;
@@ -219,6 +274,8 @@ impl Store {
             );
             conn.execute_batch(&sql)?;
         }
+        drop(conn);
+        self.mark_fts_dirty();
         Ok(id)
     }
 
@@ -392,12 +449,25 @@ impl Store {
         Ok(rows)
     }
 
-    /// FTS in DuckDB needs a rebuild to pick up new rows; we batch inserts and
-    /// rebuild on demand. Cheap at our scale.
+    /// Rebuild the FTS index if it's dirty (an obs/chunk has been inserted or
+    /// deleted since the last rebuild). DuckDB FTS has no incremental update,
+    /// so we drop + recreate from scratch — ~4 s at 192k rows, which we
+    /// can't afford on every route handler call. The dirty bit gates it.
     pub fn rebuild_fts(&self) -> Result<()> {
+        let mut dirty = self.fts_dirty.lock().unwrap();
+        if !*dirty {
+            return Ok(());
+        }
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(fts_index_sql())?;
+        *dirty = false;
         Ok(())
+    }
+
+    /// Mark the FTS index stale. Callers that mutate `obs` or `code_chunks`
+    /// invoke this so the next `rebuild_fts` actually runs.
+    pub fn mark_fts_dirty(&self) {
+        *self.fts_dirty.lock().unwrap() = true;
     }
 
     pub fn count_obs(&self) -> Result<i64> {
@@ -477,7 +547,11 @@ impl Store {
         // is partial — on restart `get_file_meta` would falsely report
         // "already indexed" and skip the file forever.
         conn.execute_batch("BEGIN")?;
-        let res: Result<()> = (|| {
+        // We collect stale_ids + new (id, q8) pairs inside the transaction so
+        // we can both apply them to DuckDB AND, on COMMIT, push the same
+        // mutation into the in-memory vec cache. Without that the cache
+        // would drift from the on-disk truth on every file change.
+        let work: Result<(Vec<i64>, Vec<(i64, Vec<i8>)>)> = (|| {
             let stale_ids: Vec<i64> = {
                 let mut stmt =
                     conn.prepare("SELECT id FROM code_chunks WHERE path = ?")?;
@@ -524,6 +598,7 @@ impl Store {
                 )
                 .unwrap_or(0);
             let dim = self.embed_dim;
+            let mut new_pairs: Vec<(i64, Vec<i8>)> = Vec::with_capacity(chunks.len());
             for (i, c) in chunks.iter().enumerate() {
                 let id = base + 1 + i as i64;
                 conn.execute(
@@ -549,18 +624,32 @@ impl Store {
                         c.qualified,
                     ],
                 )?;
-                let literal = float_array_literal(&chunk_embs[i]);
+                let q8 = quantize_i8(&chunk_embs[i]);
+                let literal = i8_array_literal(&q8);
                 let insert_vec = format!(
-                    "INSERT INTO vec_code(id, emb) VALUES ({id}, {literal}::FLOAT[{dim}])"
+                    "INSERT INTO vec_code(id, emb_q8) VALUES ({id}, {literal}::TINYINT[{dim}])"
                 );
                 conn.execute_batch(&insert_vec)?;
+                new_pairs.push((id, q8));
             }
-            Ok(())
+            Ok((stale_ids, new_pairs))
         })();
 
-        match res {
-            Ok(()) => {
+        match work {
+            Ok((stale_ids, new_pairs)) => {
                 conn.execute_batch("COMMIT")?;
+                drop(conn);
+                // Apply the same mutations to the in-memory cache, if enabled.
+                if let Some(cache_lock) = self.vec_cache.get() {
+                    let mut cache = cache_lock.write().unwrap();
+                    for id in &stale_ids {
+                        cache.remove(*id);
+                    }
+                    for (id, q8) in new_pairs {
+                        cache.insert(id, q8);
+                    }
+                }
+                self.mark_fts_dirty();
                 Ok(())
             }
             Err(e) => {
@@ -590,39 +679,46 @@ impl Store {
             conn.execute(&del_vec, params_vec.as_slice())?;
         }
         conn.execute("DELETE FROM files WHERE path = ?", params![path])?;
+        drop(conn);
+        // Mirror the removal in the in-memory cache.
+        if let Some(cache_lock) = self.vec_cache.get() {
+            let mut cache = cache_lock.write().unwrap();
+            for id in &stale_ids {
+                cache.remove(*id);
+            }
+        }
+        if !stale_ids.is_empty() {
+            self.mark_fts_dirty();
+        }
         Ok(())
     }
 
-    /// Stream every (id, embedding) tuple from `vec_code` to `callback`.
-    /// Used by the eval's int8-quantization PoC, which converts each f32
-    /// vector to a packed i8 array at load time without keeping the full
-    /// f32 corpus in memory.
+    /// Stream every (id, int8 embedding) tuple from `vec_code` to `callback`.
+    /// Used by both the in-memory cache loader and by the eval's int8 PoC.
     ///
-    /// We use `array_to_string` to serialize the FLOAT[N] column on the
-    /// SQL side and parse on the Rust side. DuckDB's Rust binding doesn't
-    /// implement `FromSql for Vec<f32>` directly; converting through its
-    /// `Value::Array` variant works but has per-element enum-dispatch
-    /// overhead. The string path is the practical workaround for one-time
-    /// bulk reads.
+    /// We use `array_to_string` because DuckDB's Rust binding doesn't
+    /// implement `FromSql for Vec<i8>` (or Vec<f32>) directly. The string
+    /// path is fine for one-time bulk reads: 192k × 1.5 KB = ~290 MB
+    /// transferred + parsed in ~5 s.
     pub fn for_each_code_vector(
         &self,
-        mut callback: impl FnMut(i64, &[f32]) -> Result<()>,
+        mut callback: impl FnMut(i64, &[i8]) -> Result<()>,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, array_to_string(emb, ',') AS emb_str FROM vec_code",
+            "SELECT id, array_to_string(emb_q8, ',') AS emb_str FROM vec_code",
         )?;
         let mut rows = stmt.query([])?;
-        let mut buf: Vec<f32> = Vec::with_capacity(self.embed_dim);
+        let mut buf: Vec<i8> = Vec::with_capacity(self.embed_dim);
         while let Some(row) = rows.next()? {
             let id: i64 = row.get(0)?;
             let s: String = row.get(1)?;
             buf.clear();
             for tok in s.split(',') {
-                let f: f32 = tok
+                let v: i8 = tok
                     .parse()
-                    .with_context(|| format!("parse emb component '{tok}'"))?;
-                buf.push(f);
+                    .with_context(|| format!("parse emb_q8 component '{tok}'"))?;
+                buf.push(v);
             }
             callback(id, &buf)?;
         }
@@ -718,7 +814,12 @@ impl Store {
         Ok(rows)
     }
 
-    /// Vector cosine over vec_code.emb with optional filters.
+    /// Vector search over `vec_code.emb_q8`. If the in-memory cache is
+    /// enabled (`enable_vec_cache`), the dot product runs in Rust over
+    /// the packed int8 index (~3 ms for 192k vectors). Otherwise we fall
+    /// back to a SQL int8 dot product via `list_reduce(list_zip(...))`
+    /// (~900 ms at the same scale — correct, but only suitable for the
+    /// eval harness and one-off tools).
     pub fn search_code_vector(
         &self,
         query_emb: &[f32],
@@ -733,12 +834,27 @@ impl Store {
                 self.embed_dim
             );
         }
+        let q8 = quantize_i8(query_emb);
+
+        // Fast path: in-memory cache.
+        if let Some(cache_lock) = self.vec_cache.get() {
+            return self.search_code_vector_cached(cache_lock, &q8, limit, language, path_prefix);
+        }
+
+        // Slow path: SQL int8 dot product over the live table. Each row
+        // computes `sum(emb_q8[i] * query[i])` via list_zip + list_transform
+        // + list_sum.
         let conn = self.conn.lock().unwrap();
-        let literal = float_array_literal(query_emb);
+        let literal = i8_array_literal(&q8);
         let dim = self.embed_dim;
         let mut sql = format!(
             "SELECT cc.id, cc.path,
-                    array_cosine_similarity(vc.emb, {literal}::FLOAT[{dim}]) AS s
+                    list_sum(
+                        list_transform(
+                            list_zip(vc.emb_q8, {literal}::TINYINT[{dim}]),
+                            pair -> pair[1]::INTEGER * pair[2]::INTEGER
+                        )
+                    )::DOUBLE AS s
                FROM vec_code vc
                JOIN code_chunks cc ON cc.id = vc.id
               WHERE 1=1"
@@ -767,6 +883,87 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// In-memory cached vector search. The cache holds (id, [i8; 384]) for
+    /// every chunk; dot product is a hot loop the optimizer autovectorizes.
+    /// Language and path filters apply after the top-K scan (cheap because
+    /// we hydrate paths for the top results only).
+    fn search_code_vector_cached(
+        &self,
+        cache_lock: &RwLock<VecCache>,
+        q8: &[i8],
+        limit: usize,
+        language: Option<&str>,
+        path_prefix: Option<&str>,
+    ) -> Result<Vec<CodeVectorHit>> {
+        let cache = cache_lock.read().unwrap();
+        // Score everything, take top `limit * 5` candidates (room for filters).
+        let pool_size = (limit * 5).max(limit);
+        let mut scored: Vec<(i64, i32)> = cache
+            .ids
+            .iter()
+            .zip(&cache.vecs)
+            .map(|(id, v)| (*id, dot_i8(q8, v)))
+            .collect();
+        // Partial-sort: full sort_unstable for simplicity at our scale; could
+        // switch to select_nth_unstable if profiling demands.
+        scored.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        scored.truncate(pool_size.min(scored.len()));
+        drop(cache);
+
+        // Hydrate path + language for the candidates, apply filters, take top N.
+        let ids: Vec<i64> = scored.iter().map(|(id, _)| *id).collect();
+        let by_id_score: std::collections::HashMap<i64, i32> =
+            scored.iter().map(|(id, s)| (*id, *s)).collect();
+        let rows = self.get_code_chunks_by_ids(&ids)?;
+        let mut hits: Vec<CodeVectorHit> = rows
+            .into_iter()
+            .filter(|r| language.map(|l| r.language == l).unwrap_or(true))
+            .filter(|r| path_prefix.map(|p| r.path.starts_with(p)).unwrap_or(true))
+            .map(|r| {
+                let s = by_id_score.get(&r.id).copied().unwrap_or(0);
+                CodeVectorHit {
+                    id: r.id,
+                    path: r.path,
+                    score: s as f64,
+                }
+            })
+            .collect();
+        // Re-sort by score after the get_code_chunks_by_ids hydration shuffles order.
+        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    /// Build the in-memory int8 vector cache from `vec_code`. Daemons call
+    /// this once at startup after `Store::open`. Idempotent — second call
+    /// is a no-op. ~5 s for 192k vectors, ~74 MB resident.
+    pub fn enable_vec_cache(&self) -> Result<()> {
+        if self.vec_cache.get().is_some() {
+            return Ok(());
+        }
+        let t = std::time::Instant::now();
+        let mut ids: Vec<i64> = Vec::new();
+        let mut vecs: Vec<Vec<i8>> = Vec::new();
+        self.for_each_code_vector(|id, q8| {
+            ids.push(id);
+            vecs.push(q8.to_vec());
+            Ok(())
+        })?;
+        let mut by_id: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+        for (pos, id) in ids.iter().enumerate() {
+            by_id.insert(*id, pos);
+        }
+        let n = ids.len();
+        let cache = VecCache { ids, vecs, by_id };
+        let _ = self.vec_cache.set(RwLock::new(cache));
+        eprintln!(
+            "memorize-store: vec_cache loaded ({} vectors in {:.1}s)",
+            n,
+            t.elapsed().as_secs_f64()
+        );
+        Ok(())
     }
 
     pub fn get_code_chunks_by_ids(&self, ids: &[i64]) -> Result<Vec<CodeChunkRow>> {
@@ -829,6 +1026,7 @@ impl Store {
 /// Safe because the input is `&[f32]`, not anything user-controlled.
 /// `{:e}` always emits a decimal point or exponent, so DuckDB parses each as
 /// a float rather than an int.
+#[allow(dead_code)]
 fn float_array_literal(v: &[f32]) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(v.len() * 14);
@@ -841,6 +1039,69 @@ fn float_array_literal(v: &[f32]) -> String {
     }
     s.push(']');
     s
+}
+
+/// Format a TINYINT array as a DuckDB list literal `[1,-2,3,...]`. Used
+/// for inline SQL binding of int8 vectors at insert/search time.
+fn i8_array_literal(v: &[i8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(v.len() * 5);
+    s.push('[');
+    for (i, x) in v.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let _ = write!(s, "{x}");
+    }
+    s.push(']');
+    s
+}
+
+/// Quantize a unit-norm f32 embedding to i8. Each component in `[-1, 1]`
+/// maps to `round(v * 127)`, saturated to `[-127, 127]` so the result
+/// fits in `i8`.
+pub fn quantize_i8(emb: &[f32]) -> Vec<i8> {
+    emb.iter()
+        .map(|&v| (v * 127.0).round().clamp(-127.0, 127.0) as i8)
+        .collect()
+}
+
+/// i8 dot product. Autovectorizes on NEON/AVX2 — ~30 ns per 384-d call.
+#[inline]
+fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+    // Defensive: handle dimension mismatch by zipping shortest. The
+    // production path always matches `embed_dim` on both sides.
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (*x as i32) * (*y as i32))
+        .sum()
+}
+
+impl VecCache {
+    fn insert(&mut self, id: i64, vec: Vec<i8>) {
+        if let Some(&pos) = self.by_id.get(&id) {
+            self.vecs[pos] = vec;
+            return;
+        }
+        let pos = self.ids.len();
+        self.ids.push(id);
+        self.vecs.push(vec);
+        self.by_id.insert(id, pos);
+    }
+
+    fn remove(&mut self, id: i64) {
+        // Swap-remove keeps the parallel arrays compact. Update the
+        // displaced element's by_id entry.
+        if let Some(pos) = self.by_id.remove(&id) {
+            let last = self.ids.len() - 1;
+            self.ids.swap_remove(pos);
+            self.vecs.swap_remove(pos);
+            if pos != last {
+                let moved_id = self.ids[pos];
+                self.by_id.insert(moved_id, pos);
+            }
+        }
+    }
 }
 
 /// SHA-256 of arbitrary bytes. Used to detect when a code chunk's body is

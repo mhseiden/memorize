@@ -151,9 +151,16 @@ impl Int8Index {
     fn load(store: &Store) -> Result<Self> {
         let mut ids: Vec<i64> = Vec::new();
         let mut vecs: Vec<Q8Vec> = Vec::new();
-        store.for_each_code_vector(|id, emb| {
+        // The store now returns int8 vectors directly (production-side
+        // quantization). The PoC's local quantize_i8 is still here for
+        // the query path — we quantize the query embedding the same way.
+        store.for_each_code_vector(|id, q8| {
             ids.push(id);
-            vecs.push(quantize_i8(emb));
+            let mut arr: Q8Vec = [0i8; 384];
+            for (i, &v) in q8.iter().take(384).enumerate() {
+                arr[i] = v;
+            }
+            vecs.push(arr);
             Ok(())
         })?;
         Ok(Int8Index { ids, vecs })

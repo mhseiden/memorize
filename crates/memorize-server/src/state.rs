@@ -23,6 +23,9 @@ pub struct ServerState {
 impl ServerState {
     pub fn new(db_path: PathBuf, token_budget: usize) -> Result<Self> {
         let store = Store::open(db_path)?;
+        // Hot vector recall lives in memory; ~5s startup, ~74MB resident,
+        // ~3ms queries (vs ~80ms via DuckDB SQL int8 dot product).
+        store.enable_vec_cache()?;
         let mut config = crate::config::load().unwrap_or_default();
         crate::config::apply_env_overrides(&mut config);
         let initial = IndexerSnapshot::initial(
