@@ -292,11 +292,46 @@ fn handle_code_search(state: &ServerState, req: Request, payload: CodeSearchReq)
     let prefix = effective_prefix.as_deref();
 
     let q_emb = memorize_embed::embed(q).context("embed code query")?;
-    let mut fused = fused_code_search(state, q, &q_emb, per_stream, lang, prefix);
-    fused.truncate(limit);
-    let ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
+    let fused = fused_code_search(state, q, &q_emb, per_stream, lang, prefix);
+
+    // Per-file diversification: cap at MAX_PER_FILE chunks from any single
+    // file. Without this, large files dominate the top — memo.test.ts taking
+    // 7 slots squeezes out 5 other files. agentmemory does the same trick at
+    // session granularity; the file-level analogue is what users want for
+    // code search.
+    const MAX_PER_FILE: usize = 2;
+    let mut per_file: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut picked: Vec<(i64, f64)> = Vec::with_capacity(limit);
+    for (id, path, score) in &fused {
+        let n = per_file.entry(path.clone()).or_insert(0);
+        if *n >= MAX_PER_FILE {
+            continue;
+        }
+        *n += 1;
+        picked.push((*id, *score));
+        if picked.len() >= limit {
+            break;
+        }
+    }
+    // If diversification left us short of `limit` (small index, narrow query),
+    // backfill with the next-best chunks ignoring the per-file cap.
+    if picked.len() < limit {
+        let already: std::collections::HashSet<i64> =
+            picked.iter().map(|(id, _)| *id).collect();
+        for (id, _path, score) in &fused {
+            if picked.len() >= limit {
+                break;
+            }
+            if !already.contains(id) {
+                picked.push((*id, *score));
+            }
+        }
+    }
+
+    let ids: Vec<i64> = picked.iter().map(|(id, _)| *id).collect();
     let rows = state.store.get_code_chunks_by_ids(&ids)?;
-    let scores: Vec<f64> = fused.iter().map(|(_, s)| *s).collect();
+    let scores: Vec<f64> = picked.iter().map(|(_, s)| *s).collect();
     let results: Vec<serde_json::Value> = rows
         .into_iter()
         .zip(scores)
@@ -419,7 +454,7 @@ fn fused_code_search(
     per_stream: usize,
     lang: Option<&str>,
     prefix: Option<&str>,
-) -> Vec<(i64, f64)> {
+) -> Vec<(i64, String, f64)> {
     let bm25 = state
         .store
         .search_code_bm25(q, per_stream, lang, prefix)
@@ -431,16 +466,67 @@ fn fused_code_search(
 
     use std::collections::HashMap;
     let k = 60.0f64;
-    let mut acc: HashMap<i64, f64> = HashMap::new();
+    // Track score + path per id (path is identical across streams so first
+    // seen wins).
+    let mut acc: HashMap<i64, (f64, String)> = HashMap::new();
     for (rank, hit) in bm25.iter().enumerate() {
-        *acc.entry(hit.id).or_default() += 1.0 / (k + (rank + 1) as f64);
+        let entry = acc
+            .entry(hit.id)
+            .or_insert_with(|| (0.0, hit.path.clone()));
+        entry.0 += 1.0 / (k + (rank + 1) as f64);
     }
     for (rank, hit) in vec_hits.iter().enumerate() {
-        *acc.entry(hit.id).or_default() += 1.0 / (k + (rank + 1) as f64);
+        let entry = acc
+            .entry(hit.id)
+            .or_insert_with(|| (0.0, hit.path.clone()));
+        entry.0 += 1.0 / (k + (rank + 1) as f64);
     }
-    let mut fused: Vec<(i64, f64)> = acc.into_iter().collect();
-    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Path-segment exact-match boost. If a query token appears as a literal
+    // path segment (split on /_-.), the chunk gets a bonus per match. This
+    // mirrors what humans usually expect from code search — typing "memo"
+    // should surface files under .../irMemo/memo.ts before chat-heavy chunks
+    // that just happen to mention "memo" a lot. We pick the boost magnitude
+    // (~0.02 per match) to be roughly equal to one stream's RRF score at
+    // rank 1; two path-segment matches ≈ ranking #1 in both streams.
+    let q_tokens = tokenize_for_path_boost(q);
+    if !q_tokens.is_empty() {
+        for (_id, (score, path)) in acc.iter_mut() {
+            let matches = count_path_segment_matches(path, &q_tokens);
+            *score += 0.02 * matches as f64;
+        }
+    }
+
+    let mut fused: Vec<(i64, String, f64)> = acc
+        .into_iter()
+        .map(|(id, (score, path))| (id, path, score))
+        .collect();
+    fused.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
     fused
+}
+
+/// Lowercase + split the query on whitespace and `/_-.` so each token can be
+/// compared against path segments. Returns empty for whitespace-only input.
+fn tokenize_for_path_boost(q: &str) -> Vec<String> {
+    q.split(|c: char| c.is_whitespace() || matches!(c, '/' | '_' | '-' | '.'))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect()
+}
+
+/// Count how many query tokens appear as exact (case-insensitive) path
+/// segments. Segments are the slash-separated components AND their
+/// underscore/dot/dash sub-pieces, so `packages/entities/src/irMemo/memo.ts`
+/// yields {packages, entities, src, irmemo, memo, ts}. Each match counts at
+/// most once per token to keep the boost bounded.
+fn count_path_segment_matches(path: &str, q_tokens: &[String]) -> usize {
+    use std::collections::HashSet;
+    let segs: HashSet<String> = path
+        .split(|c: char| matches!(c, '/' | '_' | '-' | '.'))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect();
+    q_tokens.iter().filter(|t| segs.contains(*t)).count()
 }
 
 fn handle_syn(state: &ServerState, req: Request, payload: SynReq) -> Result<()> {

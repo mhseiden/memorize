@@ -87,16 +87,25 @@ CREATE TABLE IF NOT EXISTS files (
 -- One row per AST chunk. Body hash makes re-indexing the same file a no-op
 -- when content didn't change.
 CREATE TABLE IF NOT EXISTS code_chunks (
-    id         BIGINT  PRIMARY KEY,
-    path       VARCHAR NOT NULL,
-    language   VARCHAR NOT NULL,
-    line_start INTEGER NOT NULL,
-    line_end   INTEGER NOT NULL,
-    kind       VARCHAR NOT NULL,
-    qualified  VARCHAR NOT NULL,
-    body       VARCHAR NOT NULL,
-    body_hash  BLOB    NOT NULL
+    id          BIGINT  PRIMARY KEY,
+    path        VARCHAR NOT NULL,
+    language    VARCHAR NOT NULL,
+    line_start  INTEGER NOT NULL,
+    line_end    INTEGER NOT NULL,
+    kind        VARCHAR NOT NULL,
+    qualified   VARCHAR NOT NULL,
+    body        VARCHAR NOT NULL,
+    body_hash   BLOB    NOT NULL,
+    -- FTS-friendly tokenization of (path + qualified). Path separators
+    -- (`/_-.`) flatten to spaces, and camelCase identifiers in `qualified`
+    -- split on case boundaries (`snapshotMemoGraph` → `snapshot Memo Graph`).
+    -- Without this, query "memo" doesn't match qualified=`snapshotMemoGraph`
+    -- because DuckDB's FTS tokenizer keeps camelCase as a single token.
+    -- Populated at upsert and force-recomputed on every store init so the
+    -- tokenization stays in sync with whatever rule we used last.
+    path_tokens VARCHAR
 );
+ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS path_tokens VARCHAR;
 
 CREATE TABLE IF NOT EXISTS vec_code (
     id  BIGINT PRIMARY KEY,
@@ -109,8 +118,28 @@ CREATE TABLE IF NOT EXISTS vec_code (
 
 /// FTS indexes — rebuilt periodically since DuckDB's FTS has no
 /// incremental update. Cheap at our scale.
+///
+/// DuckDB FTS allows multiple columns per index but only one index per
+/// table. We index body + qualified + path_tokens in a single combined
+/// index so `match_bm25` scores across all three fields at once. Earlier
+/// the table had two back-to-back `create_fts_index` calls with
+/// `overwrite=1`; the second silently replaced the first, leaving only
+/// `qualified` indexed and `body` BM25 effectively dead.
 pub fn fts_index_sql() -> &'static str {
     "PRAGMA create_fts_index('obs', 'id', 'body', overwrite=1);
-     PRAGMA create_fts_index('code_chunks', 'id', 'body', overwrite=1);
-     PRAGMA create_fts_index('code_chunks', 'id', 'qualified', overwrite=1);"
+     PRAGMA create_fts_index('code_chunks', 'id', 'body', 'qualified', 'path_tokens', overwrite=1);"
+}
+
+/// Force-recompute `path_tokens` on store init. Cheap at our scale (~84k
+/// rows on slate, single UPDATE) and guarantees the column matches whatever
+/// tokenization rule the codebase last shipped — no stale tokens when we
+/// change the rule. Computes path-separator splits + camelCase splits of
+/// `qualified` into a single space-separated lowercased token stream.
+pub fn backfill_path_tokens_sql() -> &'static str {
+    "UPDATE code_chunks
+        SET path_tokens = lower(
+            regexp_replace(path, '[/_.\\-]', ' ', 'g')
+            || ' '
+            || regexp_replace(qualified, '([a-z])([A-Z])', '\\1 \\2', 'g')
+        )"
 }

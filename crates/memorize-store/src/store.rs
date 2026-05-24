@@ -1,5 +1,5 @@
 use crate::DEFAULT_EMBED_DIM;
-use crate::schema::{fts_index_sql, schema_sql};
+use crate::schema::{backfill_path_tokens_sql, fts_index_sql, schema_sql};
 use crate::synonyms_seed::DEFAULT_PAIRS;
 use anyhow::{Context, Result, bail};
 use duckdb::{Connection, params};
@@ -106,6 +106,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(&schema_sql(self.embed_dim))
             .context("apply schema")?;
+        conn.execute_batch(backfill_path_tokens_sql())
+            .context("backfill path_tokens")?;
         conn.execute_batch(fts_index_sql()).context("create fts index")?;
         drop(conn);
         self.seed_synonyms_once()?;
@@ -504,8 +506,13 @@ impl Store {
                 let id = base + 1 + i as i64;
                 conn.execute(
                     "INSERT INTO code_chunks(id, path, language, line_start, line_end,
-                                             kind, qualified, body, body_hash)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                             kind, qualified, body, body_hash, path_tokens)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                             lower(
+                                 regexp_replace(?, '[/_.\\-]', ' ', 'g')
+                                 || ' '
+                                 || regexp_replace(?, '([a-z])([A-Z])', '\\1 \\2', 'g')
+                             ))",
                     params![
                         id,
                         path,
@@ -516,6 +523,8 @@ impl Store {
                         c.qualified,
                         c.body,
                         hash_bytes(c.body.as_bytes()),
+                        path,
+                        c.qualified,
                     ],
                 )?;
                 let literal = float_array_literal(&chunk_embs[i]);
@@ -576,9 +585,26 @@ impl Store {
         path_prefix: Option<&str>,
     ) -> Result<Vec<CodeBM25Hit>> {
         let conn = self.conn.lock().unwrap();
+        // The transforms inside `match_bm25` mirror the same regex pair used
+        // for `path_tokens` at index time (see `backfill_path_tokens_sql`):
+        // first split camelCase boundaries (`snapshotMemoGraph` →
+        // `snapshot Memo Graph`), then split path-style separators
+        // (`packages/.../irMemo/memo.ts` → `packages ... irMemo memo ts`).
+        // Without this, a query like `irMemo/memo.ts` would tokenize as a
+        // single FTS token and miss everything we indexed. Co-located with
+        // the search SQL so changing one rule keeps both sides in lockstep —
+        // no Rust-side mirror to drift.
         let mut sql = String::from(
             "SELECT cc.id, cc.path,
-                    fts_main_code_chunks.match_bm25(cc.id, ?) AS score
+                    fts_main_code_chunks.match_bm25(
+                        cc.id,
+                        regexp_replace(
+                            regexp_replace(?, '([a-z])([A-Z])', '\\1 \\2', 'g'),
+                            '[/_.\\-]',
+                            ' ',
+                            'g'
+                        )
+                    ) AS score
                FROM code_chunks cc
               WHERE score IS NOT NULL",
         );
