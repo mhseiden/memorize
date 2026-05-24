@@ -1,0 +1,143 @@
+# Hand-curated query bank for `memorize-eval code-eval`.
+#
+# Each entry has:
+#   query     — what we'd type into code recall
+#   expect    — one or more path substrings; any match in top-K counts as recall
+#   category  — short tag for per-bucket roll-ups
+#   path_prefix (optional) — restrict the search to this prefix; mirrors what
+#                            production code_recall does when scope=current.
+#
+# Roughly grouped by query style. Add freely.
+
+# ---------- Symbol queries (single identifier, often camelCase) ----------
+
+[[queries]]
+query = "snapshotMemoGraph"
+expect = ["/irMemo/memo.ts"]
+category = "symbol"
+
+[[queries]]
+query = "getMemoDebug"
+expect = ["/irMemo/memo.ts", "/workbook/fetch/cache.ts", "/workbook/fetch/baseFetchManager.ts"]
+category = "symbol"
+
+[[queries]]
+query = "fused_code_search"
+expect = ["memorize-recall/src/code.rs"]
+category = "symbol"
+
+[[queries]]
+query = "split_to_token_cap"
+expect = ["memorize-embed/src/lib.rs"]
+category = "symbol"
+
+[[queries]]
+query = "enforce_token_cap"
+expect = ["memorize-server/src/code_indexer.rs", "memorize-cli/src/bench.rs"]
+category = "symbol"
+
+[[queries]]
+query = "upsert_code_file"
+expect = ["memorize-store/src/store.rs"]
+category = "symbol"
+
+[[queries]]
+query = "mkCacheKeyFromQueryPlan"
+expect = ["/workbook/fetch/cache.ts"]
+category = "symbol"
+
+# ---------- Path-style queries ----------
+
+[[queries]]
+query = "irMemo/memo.ts"
+expect = ["/irMemo/memo.ts"]
+category = "path"
+
+[[queries]]
+query = "memorize-embed"
+expect = ["memorize-embed/"]
+category = "path"
+
+[[queries]]
+query = "memorize-recall pipeline"
+expect = ["memorize-recall/src/pipeline.rs"]
+category = "path"
+
+[[queries]]
+query = "code_indexer.rs"
+expect = ["memorize-server/src/code_indexer.rs"]
+category = "path"
+
+# ---------- Conceptual / phrase queries ----------
+
+[[queries]]
+query = "IR memo memoization cache"
+expect = ["/irMemo/", "/workbook/fetch/cache.ts"]
+category = "concept"
+
+[[queries]]
+query = "BM25 FTS index rebuild"
+expect = ["memorize-store/src/schema.rs", "memorize-store/src/store.rs"]
+category = "concept"
+
+[[queries]]
+query = "Metal kernel embedding model"
+expect = ["memorize-embed/"]
+category = "concept"
+
+[[queries]]
+query = "token cap splitter"
+expect = ["memorize-embed/src/lib.rs", "memorize-server/src/code_indexer.rs"]
+category = "concept"
+
+[[queries]]
+query = "RRF fusion ranking"
+expect = ["memorize-recall/src/rrf.rs", "memorize-recall/src/code.rs"]
+category = "concept"
+
+[[queries]]
+query = "session diversification"
+expect = ["memorize-recall/src/diversify.rs", "memorize-recall/src/pipeline.rs"]
+category = "concept"
+
+[[queries]]
+query = "synonym expansion query"
+expect = ["memorize-recall/src/expand.rs", "memorize-store/src/store.rs"]
+category = "concept"
+
+[[queries]]
+query = "tree-sitter chunker"
+expect = ["memorize-code/src/lib.rs"]
+category = "concept"
+
+[[queries]]
+query = "watcher debounce file events"
+expect = ["memorize-server/src/code_indexer.rs"]
+category = "concept"
+
+# ---------- Cross-repo (sigma) ----------
+
+[[queries]]
+query = "workbook publish lifecycle"
+expect = ["/workbook/", "/slate/"]
+category = "sigma-concept"
+
+[[queries]]
+query = "FetchCache reuse candidates"
+expect = ["/workbook/fetch/cache.ts"]
+category = "sigma-concept"
+
+[[queries]]
+query = "PivotTable navigation"
+expect = ["/PivotTable/"]
+category = "sigma-concept"
+
+[[queries]]
+query = "WorkbookController"
+expect = ["WorkbookController"]
+category = "sigma-symbol"
+
+[[queries]]
+query = "GraphQL mainChunkExtracted"
+expect = ["/gql/src/mainChunkExtracted.ts"]
+category = "sigma-symbol"

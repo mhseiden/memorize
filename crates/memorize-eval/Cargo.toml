@@ -21,3 +21,4 @@ ureq = { workspace = true }
 sha2 = { workspace = true }
 chrono = { workspace = true }
 duckdb = { workspace = true }
+toml = { workspace = true }

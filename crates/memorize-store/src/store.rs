@@ -83,6 +83,28 @@ impl Store {
         Ok(store)
     }
 
+    /// Open a DuckDB read-only at the given path with the default embedding
+    /// dim. Used by the eval harness so it can ablate modes against a live
+    /// daemon's index — DuckDB allows concurrent readers alongside one
+    /// writer, so the indexer keeps running while we query. Skips the
+    /// `init()` migrations because we'd lack write privileges anyway, and
+    /// the live DB has already had its schema applied.
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_read_only_with_dim(path, DEFAULT_EMBED_DIM)
+    }
+
+    pub fn open_read_only_with_dim<P: AsRef<Path>>(path: P, dim: usize) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?,
+        )
+        .context("open duckdb read-only")?;
+        Ok(Store {
+            conn: Mutex::new(conn),
+            embed_dim: dim,
+        })
+    }
+
     /// In-memory store at the default dim — used by store tests.
     pub fn open_in_memory() -> Result<Self> {
         Self::open_in_memory_with_dim(DEFAULT_EMBED_DIM)
@@ -569,6 +591,32 @@ impl Store {
         }
         conn.execute("DELETE FROM files WHERE path = ?", params![path])?;
         Ok(())
+    }
+
+    /// Sample N chunks at random, returning `(path, qualified)`. Used by the
+    /// eval harness to build a synthetic query bank from the live index.
+    /// Filters to rows with a non-trivial `qualified` so the symbol token
+    /// is usable as a query.
+    pub fn sample_code_chunks(&self, n: usize) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        // SAMPLE wants a constant literal, not a parameter. Validate the
+        // count so we don't get a SQL injection vector here.
+        let n = n.min(1_000_000);
+        let sql = format!(
+            "SELECT path, qualified
+               FROM code_chunks
+              WHERE qualified IS NOT NULL
+                AND length(qualified) >= 6
+                AND qualified NOT LIKE '%#part-%'
+              USING SAMPLE {n} ROWS"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn count_code_chunks(&self) -> Result<i64> {

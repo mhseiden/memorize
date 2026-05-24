@@ -5,6 +5,7 @@
 //!   `memorize-eval run ...` — run the harness with the given ablation knobs
 
 mod cache;
+mod code_eval;
 mod dataset;
 mod harness;
 mod metrics;
@@ -49,6 +50,27 @@ enum Cmd {
         /// Disable the on-disk embedding cache (useful for cold-cache timing baselines).
         #[arg(long)]
         no_cache: bool,
+    },
+    /// Run the code-recall A/B harness against the live `~/.memorize/db.duckdb`
+    /// (opened read-only — the daemon can keep indexing). Sweeps Hybrid /
+    /// Bm25Only / VectorOnly and reports R@K + MRR.
+    CodeEval {
+        /// Path to the DuckDB file. Defaults to ~/.memorize/db.duckdb.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Hand-curated query bank (TOML).
+        #[arg(long, default_value = "bench/code-queries.toml")]
+        bank: PathBuf,
+        /// Top-K returned per query.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// How many synthetic queries to sample from the live index.
+        /// 0 to disable.
+        #[arg(long, default_value_t = 200)]
+        synthetic: usize,
+        /// Output directory for code-eval.md / code-eval.json.
+        #[arg(long, default_value = "out")]
+        out: PathBuf,
     },
 }
 
@@ -100,6 +122,19 @@ fn main() -> Result<()> {
                 use_synonyms: synonyms,
             };
             harness::run(cfg, limit, &out, !no_cache)
+        }
+        Cmd::CodeEval { db, bank, limit, synthetic, out } => {
+            let db_path = db.unwrap_or_else(|| {
+                let home = std::env::var("HOME").expect("HOME unset");
+                PathBuf::from(home).join(".memorize/db.duckdb")
+            });
+            code_eval::run(code_eval::CodeEvalOpts {
+                db_path,
+                bank_path: bank,
+                limit,
+                synthetic_count: synthetic,
+                out_dir: out,
+            })
         }
     }
 }
