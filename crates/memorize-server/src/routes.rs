@@ -52,10 +52,16 @@ struct CodeSearchReq {
     limit: Option<usize>,
     #[serde(default)]
     language: Option<String>,
+    /// Agent-controlled explicit narrowing. Overrides cwd-based auto-scope.
     #[serde(default)]
-    path_prefix: Option<String>,
-    /// Caller's cwd, used to warn when the caller is operating outside the
-    /// indexed roots (`code_recall` won't find files from there).
+    path: Option<String>,
+    /// "auto" (default) | "current" | "all". Agent's policy for cwd-based scoping.
+    #[serde(default)]
+    scope: Option<String>,
+    /// Caller's working directory at MCP-shim startup. Not part of the
+    /// agent-facing tool schema — the shim sets it as transport metadata.
+    /// Used to derive an auto-scope when `path` is absent and `scope` isn't
+    /// "all".
     #[serde(default)]
     cwd: Option<String>,
 }
@@ -260,10 +266,19 @@ fn handle_status(state: &ServerState, req: Request) -> Result<()> {
 }
 
 fn handle_code_search(state: &ServerState, req: Request, payload: CodeSearchReq) -> Result<()> {
-    // FTS index needs a rebuild if recent code chunks were written; cheap.
     let _ = state.store.rebuild_fts();
     let q = payload.query.trim();
-    let warnings = build_warnings(state, payload.cwd.as_deref());
+    let scope_arg = payload.scope.as_deref().unwrap_or("auto");
+
+    // Resolve the effective path filter + any user-facing warnings.
+    // Explicit `path` from the agent overrides cwd-based auto-scope.
+    let (mut effective_prefix, mut warnings, fall_back_allowed) = resolve_scope(
+        state,
+        payload.cwd.as_deref(),
+        payload.path.as_deref(),
+        scope_arg,
+    );
+
     if q.is_empty() {
         return respond_json(
             req,
@@ -274,34 +289,31 @@ fn handle_code_search(state: &ServerState, req: Request, payload: CodeSearchReq)
     let limit = payload.limit.unwrap_or(10);
     let per_stream = 50usize;
     let lang = payload.language.as_deref();
-    let prefix = payload.path_prefix.as_deref();
+    let mut prefix = effective_prefix.as_deref();
 
-    // BM25 + vector streams.
-    let bm25 = state
-        .store
-        .search_code_bm25(q, per_stream, lang, prefix)
-        .unwrap_or_default();
     let q_emb = memorize_embed::embed(q).context("embed code query")?;
-    let vec_hits = state
-        .store
-        .search_code_vector(&q_emb, per_stream, lang, prefix)
-        .unwrap_or_default();
 
-    // RRF fusion (k=60), no diversification (each chunk is its own entity;
-    // multiple chunks from one file is fine — the model wants to see them).
-    use std::collections::HashMap;
-    let k = 60.0f64;
-    let mut acc: HashMap<i64, f64> = HashMap::new();
-    for (rank, hit) in bm25.iter().enumerate() {
-        *acc.entry(hit.id).or_default() += 1.0 / (k + (rank + 1) as f64);
+    let mut fused = fused_code_search(state, q, &q_emb, per_stream, lang, prefix);
+
+    // Auto-scope fallback: if we got nothing in the scoped search and the
+    // caller asked for "auto", retry without the prefix and tell them.
+    if fused.is_empty() && fall_back_allowed && prefix.is_some() {
+        fused = fused_code_search(state, q, &q_emb, per_stream, lang, None);
+        if !fused.is_empty() {
+            warnings.push(format!(
+                "No matches under {}. Expanded scope to all indexed roots.",
+                effective_prefix.as_deref().unwrap_or("scope")
+            ));
+        }
+        // No further reads of these — the fallback path reissued the search
+        // already. Clear them so the response shape doesn't carry stale state.
+        let _ = effective_prefix.take();
+        prefix = None;
     }
-    for (rank, hit) in vec_hits.iter().enumerate() {
-        *acc.entry(hit.id).or_default() += 1.0 / (k + (rank + 1) as f64);
-    }
-    let mut fused: Vec<(i64, f64)> = acc.into_iter().collect();
-    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let _ = prefix; // kept for the fallback decision above; not used after
+    let _ = effective_prefix; // kept for the fallback warning above; not used after
+
     fused.truncate(limit);
-
     let ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
     let rows = state.store.get_code_chunks_by_ids(&ids)?;
     let scores: Vec<f64> = fused.iter().map(|(_, s)| *s).collect();
@@ -329,38 +341,119 @@ fn handle_code_search(state: &ServerState, req: Request, payload: CodeSearchReq)
     )
 }
 
-/// Compute caller-relevant warnings to attach to a code-search response. The
-/// big one: if `cwd` was supplied and isn't under any indexed root, the agent
-/// is operating outside the index and won't find code from here.
-fn build_warnings(state: &ServerState, cwd: Option<&str>) -> Vec<String> {
-    let mut out = Vec::new();
-    let cwd = match cwd {
-        Some(s) if !s.is_empty() => s,
-        _ => return out,
-    };
-    let cwd_path = std::path::Path::new(cwd);
-    let roots: Vec<std::path::PathBuf> = state
+/// Resolve the effective path-prefix filter for a code_recall call, plus any
+/// warnings to surface to the agent.
+///
+/// Returns `(effective_prefix, warnings, fall_back_allowed)`:
+///  - `effective_prefix`: what the search should filter on. None = no filter.
+///  - `warnings`: human-readable hints for the agent.
+///  - `fall_back_allowed`: in "auto" scope, the search can retry without
+///    a prefix if it yields 0 results. Never true for "current" or "all".
+fn resolve_scope(
+    state: &ServerState,
+    cwd: Option<&str>,
+    explicit_path: Option<&str>,
+    scope: &str,
+) -> (Option<String>, Vec<String>, bool) {
+    // Explicit `path` wins regardless of scope — the agent is asking for
+    // something specific.
+    if let Some(pref) = explicit_path {
+        return (Some(pref.to_string()), Vec::new(), false);
+    }
+
+    let roots = resolved_root_paths(state);
+    let cwd_root = cwd
+        .filter(|c| !c.is_empty())
+        .and_then(|c| {
+            let cwd_path = std::path::Path::new(c);
+            roots.iter().find(|r| cwd_path.starts_with(r)).cloned()
+        });
+
+    let mut warnings = Vec::new();
+    match scope {
+        "all" => (None, warnings, false),
+        "current" => match cwd_root {
+            Some(r) => (Some(r.display().to_string()), warnings, false),
+            None => {
+                let cwd_disp = cwd.unwrap_or("(no cwd)");
+                warnings.push(format!(
+                    "scope=current requested but cwd ({cwd_disp}) is not under any indexed root. Returning no results."
+                ));
+                // Use an impossible prefix so no rows match.
+                (Some("/dev/null/never-matches".to_string()), warnings, false)
+            }
+        },
+        // "auto" or anything unrecognized
+        _ => match cwd_root {
+            Some(r) => (Some(r.display().to_string()), warnings, true),
+            None => {
+                if let Some(c) = cwd {
+                    if !c.is_empty() {
+                        let roots_str: Vec<String> =
+                            roots.iter().map(|p| p.display().to_string()).collect();
+                        warnings.push(format!(
+                            "cwd ({c}) is not under any indexed root ({}). Searching across everything. Add this path to `code_index.roots` in ~/.memorize/config.toml to scope future queries.",
+                            roots_str.join(", ")
+                        ));
+                    }
+                }
+                (None, warnings, false)
+            }
+        },
+    }
+}
+
+/// Resolve configured roots into absolute `PathBuf`s with `~/` expansion.
+/// Missing paths are dropped — same logic the indexer uses.
+fn resolved_root_paths(state: &ServerState) -> Vec<std::path::PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    state
         .config
         .code_index
         .roots
         .iter()
         .map(|s| {
-            let home = std::env::var("HOME").unwrap_or_default();
             if let Some(rest) = s.strip_prefix("~/") {
                 std::path::PathBuf::from(&home).join(rest)
             } else {
                 std::path::PathBuf::from(s)
             }
         })
-        .collect();
-    if !roots.iter().any(|r| cwd_path.starts_with(r)) {
-        let roots_str: Vec<String> = roots.iter().map(|p| p.display().to_string()).collect();
-        out.push(format!(
-            "cwd ({cwd}) is not under any indexed root ({}). code_recall will not surface files from here. Add this path to `code_index.roots` in ~/.memorize/config.toml to index it.",
-            roots_str.join(", ")
-        ));
+        .filter(|p| p.exists())
+        .collect()
+}
+
+/// Run a single hybrid-fused code search. Pulled out so the auto-scope
+/// fallback path can call it twice without duplicating the fusion logic.
+fn fused_code_search(
+    state: &ServerState,
+    q: &str,
+    q_emb: &[f32],
+    per_stream: usize,
+    lang: Option<&str>,
+    prefix: Option<&str>,
+) -> Vec<(i64, f64)> {
+    let bm25 = state
+        .store
+        .search_code_bm25(q, per_stream, lang, prefix)
+        .unwrap_or_default();
+    let vec_hits = state
+        .store
+        .search_code_vector(q_emb, per_stream, lang, prefix)
+        .unwrap_or_default();
+
+    use std::collections::HashMap;
+    let k = 60.0f64;
+    let mut acc: HashMap<i64, f64> = HashMap::new();
+    for (rank, hit) in bm25.iter().enumerate() {
+        *acc.entry(hit.id).or_default() += 1.0 / (k + (rank + 1) as f64);
     }
-    out
+    for (rank, hit) in vec_hits.iter().enumerate() {
+        *acc.entry(hit.id).or_default() += 1.0 / (k + (rank + 1) as f64);
+    }
+    let mut fused: Vec<(i64, f64)> = acc.into_iter().collect();
+    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    fused
 }
 
 fn handle_syn(state: &ServerState, req: Request, payload: SynReq) -> Result<()> {

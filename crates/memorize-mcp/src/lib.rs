@@ -153,7 +153,7 @@ fn handle_tools_list() -> Value {
             },
             {
                 "name": "code_recall",
-                "description": "Search the indexed local codebase for semantically relevant functions, classes, or code blocks. AST-chunked via tree-sitter, hybrid BM25 + vector. Returns {path, line_start, line_end, qualified, body}. Use when you need to find where something is defined or how a concept is implemented across the codebase.",
+                "description": "Search the indexed local codebase for semantically relevant functions, classes, or code blocks. AST-chunked via tree-sitter, hybrid BM25 + vector. Returns {path, line_start, line_end, qualified, body}.\n\nAuto-scoped to the repo containing your current working directory. Override with `scope` or `path` if you need to search broader or narrower.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -167,11 +167,15 @@ fn handle_tools_list() -> Value {
                         },
                         "language": {
                             "type": "string",
-                            "description": "Optional: filter by language (rust, typescript, python, go, bash, ...)"
+                            "description": "Filter by language: rust | typescript | javascript | python | go | bash"
                         },
-                        "path_prefix": {
+                        "path": {
                             "type": "string",
-                            "description": "Optional: filter to files under this path prefix"
+                            "description": "Narrow to files under this path prefix. Overrides `scope`."
+                        },
+                        "scope": {
+                            "type": "string",
+                            "description": "auto (default; scope to cwd's repo, fall back to all if 0 results) | current (cwd's repo only, no fallback) | all (every indexed root)"
                         }
                     },
                     "required": ["query"]
@@ -245,11 +249,16 @@ fn call_code_recall(args: &Value, http_url: &str) -> Result<Value, RpcError> {
     if let Some(lang) = args.get("language").and_then(|v| v.as_str()) {
         body["language"] = json!(lang);
     }
-    if let Some(pp) = args.get("path_prefix").and_then(|v| v.as_str()) {
-        body["path_prefix"] = json!(pp);
+    if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+        body["path"] = json!(p);
     }
-    // Pass the spawn-time cwd so the server can warn when we're outside the
-    // indexed roots. Claude Code launches the MCP shim from the project root.
+    if let Some(sc) = args.get("scope").and_then(|v| v.as_str()) {
+        body["scope"] = json!(sc);
+    }
+    // Spawn-time cwd is transport metadata — not exposed in the tool schema.
+    // The server uses it to derive an auto-scope when neither `path` nor
+    // `scope=all` is set. Claude Code launches the shim from the session's
+    // project root.
     if let Ok(cwd) = std::env::current_dir() {
         body["cwd"] = json!(cwd.to_string_lossy());
     }
