@@ -15,7 +15,10 @@ memorize-embed = { workspace = true }
 memorize-recall = { workspace = true }
 memorize-server = { workspace = true }
 memorize-mcp = { workspace = true }
+memorize-code = { workspace = true }
 clap = { workspace = true }
+ignore = { workspace = true }
+tokenizers = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

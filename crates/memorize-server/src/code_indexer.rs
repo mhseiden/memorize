@@ -112,6 +112,37 @@ pub fn spawn(state: Arc<ServerState>) {
     });
 }
 
+/// Re-split chunks so none exceed the embedder's max-seq window. Same logic
+/// as the bench helper — see crates/memorize-cli/src/bench.rs.
+fn enforce_token_cap(chunks: Vec<CodeChunk>) -> anyhow::Result<Vec<CodeChunk>> {
+    let cap = memorize_embed::max_seq_tokens().saturating_sub(8).max(1);
+    let mut out: Vec<CodeChunk> = Vec::with_capacity(chunks.len());
+    for c in chunks {
+        let pieces = memorize_embed::split_to_token_cap(&c.body, cap)?;
+        if pieces.len() == 1 {
+            out.push(c);
+            continue;
+        }
+        let total = pieces.len();
+        for (i, body) in pieces.into_iter().enumerate() {
+            let qualified = if c.qualified.is_empty() {
+                format!("part-{}/{total}", i + 1)
+            } else {
+                format!("{}#part-{}/{total}", c.qualified, i + 1)
+            };
+            out.push(CodeChunk {
+                language: c.language.clone(),
+                line_start: c.line_start,
+                line_end: c.line_end,
+                kind: c.kind.clone(),
+                qualified,
+                body,
+            });
+        }
+    }
+    Ok(out)
+}
+
 fn resolved_roots(raw: &[String]) -> Vec<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     raw.iter()
@@ -281,6 +312,7 @@ fn index_file(
     if chunks.is_empty() {
         return Ok(IndexOutcome::Unchanged);
     }
+    let chunks = enforce_token_cap(chunks).context("token-cap split")?;
 
     let bodies: Vec<&str> = chunks.iter().map(|c| c.body.as_str()).collect();
     let embs = memorize_embed::embed_batch(&bodies).context("embed chunks")?;

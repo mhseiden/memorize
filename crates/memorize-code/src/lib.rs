@@ -11,10 +11,16 @@ use serde::Serialize;
 use std::path::Path;
 use tree_sitter::{Node, Parser, Tree};
 
-/// Target chunk size in characters. Mirrors `memorize_core::CHUNK_CHARS` —
-/// fits comfortably in MiniLM's 512-token window. Oversized AST nodes are
-/// recursively split.
-pub const TARGET_CHARS: usize = 1800;
+/// Target chunk size in bytes. AST splitting tries to keep chunks at or under
+/// this. Sized so an average code chunk (~3 chars/token in real codebases —
+/// measured on slate) stays under MiniLM's 512-token window with margin.
+pub const TARGET_CHARS: usize = 1500;
+
+/// Hard ceiling enforced as a post-pass. Indivisible AST leaves (a 9000-char
+/// generated GraphQL array literal, a multi-thousand-line eslint config, etc.)
+/// are line-split into pieces no larger than this. Without this, ~8% of slate
+/// chunks would silently truncate inside the embedder.
+pub const MAX_CHARS: usize = 1500;
 
 /// Below this size, sibling chunkable nodes (small consts, imports, tiny
 /// helpers) are greedy-merged so we don't generate a chunk per `use`
@@ -67,7 +73,7 @@ pub fn chunk_source(source: &str, language: &str) -> Result<Vec<CodeChunk>> {
     let tree = parser
         .parse(source, None)
         .with_context(|| format!("parse {language}"))?;
-    Ok(chunk_tree(&tree, source, language))
+    Ok(enforce_hard_cap(chunk_tree(&tree, source, language)))
 }
 
 fn load_language(language: &str) -> Result<tree_sitter::Language> {
@@ -131,6 +137,74 @@ fn chunkable_kinds(language: &str) -> &'static [&'static str] {
         "bash" => &["function_definition", "command"],
         _ => &[],
     }
+}
+
+/// Post-process: any chunk whose body exceeds `MAX_CHARS` is line-split into
+/// pieces no larger than `MAX_CHARS`. The AST chunker happily emits oversize
+/// leaves (single nodes the tree-sitter grammar can't decompose, like a
+/// 9000-char generated array literal) — without this, those leaves would
+/// silently truncate inside the embedder.
+fn enforce_hard_cap(chunks: Vec<CodeChunk>) -> Vec<CodeChunk> {
+    let mut out: Vec<CodeChunk> = Vec::with_capacity(chunks.len());
+    for c in chunks {
+        if c.body.len() <= MAX_CHARS {
+            out.push(c);
+            continue;
+        }
+        // Line-split. Each piece accumulates whole lines until adding the next
+        // would exceed MAX_CHARS; then we cut. Lines longer than MAX_CHARS on
+        // their own (extreme minified single-line files) emit as one piece —
+        // truncation will still happen there, but those are degenerate cases.
+        let mut piece_lines: Vec<&str> = Vec::new();
+        let mut piece_chars = 0usize;
+        let mut piece_first_line: u32 = c.line_start;
+        let mut cur_line: u32 = c.line_start;
+        let mut part_no: u32 = 0;
+        let total_parts_guess: u32 = (c.body.len() as u32).div_ceil(MAX_CHARS as u32);
+
+        let flush = |out: &mut Vec<CodeChunk>,
+                     piece_lines: &mut Vec<&str>,
+                     piece_first_line: u32,
+                     last_line: u32,
+                     part_no: u32| {
+            if piece_lines.is_empty() {
+                return;
+            }
+            let body = piece_lines.join("\n");
+            let qualified = if c.qualified.is_empty() {
+                format!("part-{}/{}", part_no + 1, total_parts_guess)
+            } else {
+                format!("{}#part-{}/{}", c.qualified, part_no + 1, total_parts_guess)
+            };
+            out.push(CodeChunk {
+                language: c.language.clone(),
+                line_start: piece_first_line,
+                line_end: last_line,
+                kind: c.kind.clone(),
+                qualified,
+                body,
+            });
+            piece_lines.clear();
+        };
+
+        for line in c.body.split('\n') {
+            // +1 for the joining '\n' we'll restore (except for the first line).
+            let add = line.len() + if piece_lines.is_empty() { 0 } else { 1 };
+            if piece_chars + add > MAX_CHARS && !piece_lines.is_empty() {
+                let last_line = cur_line - 1;
+                flush(&mut out, &mut piece_lines, piece_first_line, last_line, part_no);
+                part_no += 1;
+                piece_first_line = cur_line;
+                piece_chars = 0;
+            }
+            piece_lines.push(line);
+            piece_chars += add;
+            cur_line += 1;
+        }
+        let last_line = c.line_end;
+        flush(&mut out, &mut piece_lines, piece_first_line, last_line, part_no);
+    }
+    out
 }
 
 fn chunk_tree(tree: &Tree, source: &str, language: &str) -> Vec<CodeChunk> {
@@ -432,16 +506,26 @@ class UserService {
     }
 
     #[test]
-    fn oversized_node_still_emits_one_chunk() {
-        // Construct a function whose body exceeds TARGET_CHARS but has no
-        // chunkable descendants — should still emit one chunk.
+    fn oversized_node_emits_chunks_under_max_chars() {
+        // Function body exceeds MAX_CHARS and has no chunkable descendants.
+        // The hard-cap post-pass must line-split it into pieces ≤ MAX_CHARS,
+        // each tagged with the parent symbol so the source is still findable.
         let mut src = String::from("fn big() {\n");
-        for i in 0..200 {
+        for i in 0..400 {
             src.push_str(&format!("    let x{i} = {i};\n"));
         }
         src.push_str("}\n");
         let chunks = chunk_source(&src, "rust").unwrap();
-        assert!(chunks.iter().any(|c| c.qualified == "big"));
+        assert!(chunks.iter().any(|c| c.qualified.starts_with("big")));
+        for c in &chunks {
+            assert!(
+                c.body.len() <= MAX_CHARS,
+                "chunk body {} exceeds MAX_CHARS {} (qualified={})",
+                c.body.len(),
+                MAX_CHARS,
+                c.qualified
+            );
+        }
     }
 
     #[test]

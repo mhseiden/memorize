@@ -2162,6 +2162,8 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "ignore",
+ "memorize-code",
  "memorize-core",
  "memorize-embed",
  "memorize-mcp",
@@ -2170,6 +2172,7 @@ dependencies = [
  "memorize-store",
  "serde",
  "serde_json",
+ "tokenizers",
  "ureq 2.12.1",
 ]
 
@@ -2207,6 +2210,7 @@ dependencies = [
  "anyhow",
  "fastembed",
  "ort",
+ "tokenizers",
 ]
 
 [[package]]

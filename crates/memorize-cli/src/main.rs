@@ -1,3 +1,4 @@
+mod bench;
 mod capture;
 mod client;
 mod config;
@@ -58,6 +59,63 @@ enum Cmd {
     Status,
     /// Run the MCP stdio server (Claude Code spawns this).
     Mcp,
+    /// Performance / memory profiling. Subcommands run isolated against an
+    /// in-memory store — the live DB and daemon are not touched.
+    Bench {
+        #[command(subcommand)]
+        op: BenchOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum BenchOp {
+    /// Walk a root, exercise the cold-scan pipeline, report per-phase timing.
+    CodeIndex {
+        /// Repo root to scan.
+        #[arg(long)]
+        root: std::path::PathBuf,
+        /// Cap files processed (useful for quick sanity checks).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Write the markdown report to this path.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Tokenize every chunk produced by walking a root, report token-count
+    /// distribution + overflow rate vs the model's max-seq cap (512 for MiniLM).
+    Tokens {
+        /// Repo root to scan.
+        #[arg(long)]
+        root: std::path::PathBuf,
+        /// Cap files processed (for quick checks).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Token cap to overflow against. MiniLM = 512.
+        #[arg(long, default_value_t = 512)]
+        max_tokens: usize,
+        /// Path to a Hugging Face tokenizer.json. Defaults to MiniLM's cached file.
+        #[arg(long)]
+        tokenizer: Option<std::path::PathBuf>,
+        /// Write the markdown report to this path.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Sweep embed batch sizes against synthetic chunks; isolate
+    /// throughput-vs-batch-size from file I/O and tree-sitter.
+    Embed {
+        /// Comma-separated batch sizes to sweep.
+        #[arg(long, default_value = "1,2,4,8,16,32,64,128,256")]
+        sizes: String,
+        /// Total chunks embedded at each batch size (rounded up to a multiple of the batch).
+        #[arg(long, default_value_t = 512)]
+        chunks: usize,
+        /// Characters per synthetic chunk body (rough proxy for a real source-code chunk).
+        #[arg(long, default_value_t = 800)]
+        chunk_chars: usize,
+        /// Write the markdown report to this path.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -87,6 +145,30 @@ fn main() -> Result<()> {
             let http = format!("http://127.0.0.1:{}", cfg.port);
             memorize_mcp::run_stdio(&http)
         }
+        Cmd::Bench { op } => match op {
+            BenchOp::CodeIndex { root, limit, out } => bench::code_index(bench::BenchOpts {
+                root,
+                limit,
+                out,
+                separate_embed_init: true,
+            }),
+            BenchOp::Tokens { root, limit, max_tokens, tokenizer, out } => {
+                bench::tokens(bench::TokensOpts { root, limit, max_tokens, tokenizer, out })
+            }
+            BenchOp::Embed { sizes, chunks, chunk_chars, out } => {
+                let parsed: Result<Vec<usize>, _> = sizes
+                    .split(',')
+                    .map(|s| s.trim().parse::<usize>())
+                    .collect();
+                let parsed = parsed.map_err(|e| anyhow::anyhow!("invalid --sizes: {e}"))?;
+                bench::embed_sweep(bench::EmbedSweepOpts {
+                    batch_sizes: parsed,
+                    chunks,
+                    chunk_chars,
+                    out,
+                })
+            }
+        },
     }
 }
 

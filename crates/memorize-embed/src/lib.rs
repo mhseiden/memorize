@@ -1,10 +1,19 @@
 //! Text embeddings via `fastembed` 5.x.
 //!
-//! Model selection (default: `AllMiniLML6V2`):
+//! Model selection (default: `AllMiniLML6V2` — fp32):
 //!
 //! ```text
-//! MEMORIZE_EMBED_MODEL = minilm | gte-large | jina-code
+//! MEMORIZE_EMBED_MODEL = minilm | minilm-q | gte-large | jina-code
 //! ```
+//!
+//! `minilm-q` is the INT8 quantized variant. The cited 2–4× CPU speedup is
+//! x86+VNNI only — measured on M4 Pro / ORT 2.0-rc.12, INT8 was ~15% **slower**
+//! than fp32 because ORT's ARM kernels fall back to emulated INT8. Stay on fp32
+//! unless running on x86 with VNNI.
+//!
+//! See `README.md` in this crate for the backend-selection history (Candle
+//! Metal / Accelerate, INT8 quantization, CoreML EP) and why fastembed/ORT
+//! CPU is the local ceiling on Apple Silicon.
 //!
 //! Other knobs:
 //! - `MEMORIZE_MODEL_DIR`: override the ONNX cache directory (default `~/.memorize/models`).
@@ -34,6 +43,7 @@ use anyhow::{Context, Result, bail};
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
+use tokenizers::Tokenizer;
 
 #[derive(Debug, Clone)]
 struct Choice {
@@ -45,6 +55,11 @@ struct Choice {
 const MINILM: Choice = Choice {
     model: EmbeddingModel::AllMiniLML6V2,
     tag: "all-minilm-l6-v2",
+    dim: 384,
+};
+const MINILM_Q: Choice = Choice {
+    model: EmbeddingModel::AllMiniLML6V2Q,
+    tag: "all-minilm-l6-v2-q",
     dim: 384,
 };
 const GTE_LARGE: Choice = Choice {
@@ -60,6 +75,10 @@ const JINA_CODE: Choice = Choice {
 
 static CHOICE: OnceLock<Choice> = OnceLock::new();
 static EMBEDDER: OnceLock<Mutex<TextEmbedding>> = OnceLock::new();
+/// Tokenizer used for token-cap accounting. Loaded independently of the
+/// (heavier) `TextEmbedding` model; callers that just need to size inputs
+/// don't pay the ONNX initialization cost.
+static TOKENIZER: OnceLock<Tokenizer> = OnceLock::new();
 
 fn resolve_choice() -> Choice {
     match std::env::var("MEMORIZE_EMBED_MODEL")
@@ -68,10 +87,11 @@ fn resolve_choice() -> Choice {
         .as_str()
     {
         "minilm" | "all-minilm-l6-v2" | "" => MINILM,
+        "minilm-q" | "all-minilm-l6-v2-q" => MINILM_Q,
         "gte-large" | "gte-large-en-v1.5" => GTE_LARGE,
         "jina-code" | "jina-embeddings-v2-base-code" => JINA_CODE,
         other => panic!(
-            "MEMORIZE_EMBED_MODEL={other:?} is not recognized. Use minilm | gte-large | jina-code."
+            "MEMORIZE_EMBED_MODEL={other:?} is not recognized. Use minilm-q | minilm | gte-large | jina-code."
         ),
     }
 }
@@ -181,6 +201,157 @@ pub fn embed_batch(texts: &[&str]) -> Result<Vec<Vec<f32>>> {
                 expected,
                 current().tag
             );
+        }
+    }
+    Ok(out)
+}
+
+/// Max sequence length accepted by the current embedding model. Anything
+/// longer is silently truncated inside the tokenizer/model — callers can
+/// avoid that by re-splitting with [`split_to_token_cap`] first.
+pub fn max_seq_tokens() -> usize {
+    // MiniLM and Jina-code both ship with 512 in the model config. GTE-Large
+    // is 512 too despite the model architecture supporting more.
+    match current().tag {
+        "all-minilm-l6-v2" | "all-minilm-l6-v2-q" => 512,
+        "gte-large-en-v1.5" => 512,
+        "jina-embeddings-v2-base-code" => 8192,
+        _ => 512,
+    }
+}
+
+fn ensure_tokenizer() -> Result<&'static Tokenizer> {
+    if let Some(t) = TOKENIZER.get() {
+        return Ok(t);
+    }
+    // Find tokenizer.json under the current model's snapshot dir. Cache
+    // layout matches what fastembed downloads to ~/.memorize/models.
+    let dir = cache_dir();
+    let repo_dir_name = match current().tag {
+        "all-minilm-l6-v2" => "models--Qdrant--all-MiniLM-L6-v2-onnx",
+        "all-minilm-l6-v2-q" => "models--Xenova--all-MiniLM-L6-v2",
+        "gte-large-en-v1.5" => "models--Alibaba-NLP--gte-large-en-v1.5",
+        "jina-embeddings-v2-base-code" => "models--jinaai--jina-embeddings-v2-base-code",
+        other => bail!("no tokenizer mapping for model {other}"),
+    };
+    let snapshots = dir.join(repo_dir_name).join("snapshots");
+    if !snapshots.exists() {
+        // Force a download by initializing the model — first call populates
+        // the snapshot dir.
+        let _ = ensure_init()?;
+    }
+    let snap = std::fs::read_dir(&snapshots)
+        .with_context(|| format!("read snapshots dir {}", snapshots.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.join("tokenizer.json").exists())
+        .with_context(|| format!("no tokenizer.json under {}", snapshots.display()))?;
+    let mut tok = Tokenizer::from_file(snap.join("tokenizer.json"))
+        .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
+    // The vendored tokenizer.json sometimes hardcodes truncation (MiniLM ships
+    // max_length=128). Disable so callers see the actual token count — they
+    // do their own splitting based on the model's real max-seq window.
+    tok.with_truncation(None)
+        .map_err(|e| anyhow::anyhow!("disable truncation: {e}"))?;
+    let _ = TOKENIZER.set(tok);
+    Ok(TOKENIZER.get().expect("just set"))
+}
+
+/// Token count for a single string, using the current model's tokenizer.
+pub fn count_tokens(text: &str) -> Result<usize> {
+    let tok = ensure_tokenizer()?;
+    let enc = tok
+        .encode(text, false)
+        .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+    Ok(enc.get_ids().len())
+}
+
+/// Split a string into pieces whose token count is <= `cap`. Splits at line
+/// boundaries when possible — single lines longer than `cap` tokens get
+/// further split at byte boundaries proportional to their share of tokens
+/// (rare in source code; only triggered by minified single-line files).
+///
+/// Returns the original string unchanged when it already fits.
+pub fn split_to_token_cap(text: &str, cap: usize) -> Result<Vec<String>> {
+    if cap == 0 {
+        bail!("cap must be > 0");
+    }
+    if count_tokens(text)? <= cap {
+        return Ok(vec![text.to_string()]);
+    }
+    let mut pieces: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut buf_tokens = 0usize;
+    for line in text.split('\n') {
+        // Lazily push the joining newline so the count matches what the
+        // model would see if we joined pieces back together.
+        let candidate = if buf.is_empty() {
+            line.to_string()
+        } else {
+            format!("{buf}\n{line}")
+        };
+        let n = count_tokens(&candidate)?;
+        if n <= cap {
+            buf = candidate;
+            buf_tokens = n;
+            continue;
+        }
+        // Adding this line overflows. If `buf` is non-empty, flush it and
+        // start a new buffer with `line`.
+        if !buf.is_empty() {
+            pieces.push(std::mem::take(&mut buf));
+            buf_tokens = 0;
+        }
+        // The line on its own might still exceed `cap` (single huge minified
+        // line). Byte-split proportionally as a last resort.
+        let line_tokens = count_tokens(line)?;
+        if line_tokens > cap {
+            for piece in byte_split_to_token_cap(line, cap)? {
+                pieces.push(piece);
+            }
+        } else {
+            buf = line.to_string();
+            buf_tokens = line_tokens;
+        }
+    }
+    if !buf.is_empty() {
+        pieces.push(buf);
+    }
+    let _ = buf_tokens; // last value isn't read past loop exit
+    Ok(pieces)
+}
+
+/// Byte-level fallback: split `line` into roughly equal pieces such that each
+/// is under `cap` tokens. Used only when a single line is too long.
+fn byte_split_to_token_cap(line: &str, cap: usize) -> Result<Vec<String>> {
+    let total_tokens = count_tokens(line)?;
+    if total_tokens <= cap {
+        return Ok(vec![line.to_string()]);
+    }
+    let pieces_needed = total_tokens.div_ceil(cap);
+    let bytes = line.as_bytes();
+    let target_bytes_per_piece = bytes.len() / pieces_needed;
+    let mut out: Vec<String> = Vec::with_capacity(pieces_needed);
+    let mut cur = 0usize;
+    while cur < bytes.len() {
+        let mut end = (cur + target_bytes_per_piece).min(bytes.len());
+        // Don't split mid-codepoint.
+        while end < bytes.len() && (bytes[end] & 0xC0) == 0x80 {
+            end += 1;
+        }
+        // Verify under cap; if not, halve.
+        loop {
+            let slice = &line[cur..end];
+            let n = count_tokens(slice)?;
+            if n <= cap || end - cur <= 16 {
+                out.push(slice.to_string());
+                cur = end;
+                break;
+            }
+            end = cur + (end - cur) / 2;
+            while end < bytes.len() && (bytes[end] & 0xC0) == 0x80 {
+                end += 1;
+            }
         }
     }
     Ok(out)

@@ -8,3 +8,4 @@ publish.workspace = true
 fastembed = { workspace = true }
 ort = { workspace = true }
 anyhow = { workspace = true }
+tokenizers = { workspace = true }
