@@ -6,11 +6,13 @@
 //! struct exposes the knobs the eval harness varies for ablation; callers
 //! who don't care use `RecallConfig::default()`.
 
-pub mod expand;
-pub mod rrf;
+pub mod code;
 pub mod diversify;
+pub mod expand;
 pub mod pipeline;
+pub mod rrf;
 
+pub use code::{CodeRecallConfig, CodeRecalled, recall_code};
 pub use pipeline::{Recalled, recall, recall_with_config};
 
 /// Which retrieval streams contribute to the fused result.
