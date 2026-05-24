@@ -26,6 +26,13 @@ impl ServerState {
         // Hot vector recall lives in memory; ~5s startup, ~74MB resident,
         // ~3ms queries (vs ~80ms via DuckDB SQL int8 dot product).
         store.enable_vec_cache()?;
+        let store = Arc::new(store);
+        // Background FTS rebuild loop. Polls every 5s; rebuilds take ~4s on
+        // 192k chunks but happen on a cloned DuckDB connection so route
+        // handlers don't block on them. DuckDB MVCC keeps the snapshots
+        // coherent — search queries see either the pre- or post-rebuild
+        // FTS state depending on when they snapshotted.
+        Store::spawn_fts_worker(Arc::clone(&store), std::time::Duration::from_secs(5))?;
         let mut config = crate::config::load().unwrap_or_default();
         crate::config::apply_env_overrides(&mut config);
         let initial = IndexerSnapshot::initial(
@@ -33,7 +40,7 @@ impl ServerState {
             config.code_index.enabled,
         );
         Ok(Self {
-            store: Arc::new(store),
+            store,
             dedup: Arc::new(Dedup::new()),
             privacy: Arc::new(PrivacyFilter::new()),
             token_budget,

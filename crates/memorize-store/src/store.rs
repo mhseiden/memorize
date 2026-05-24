@@ -8,7 +8,8 @@ use anyhow::{Context, Result, bail};
 use duckdb::{Connection, params};
 use memorize_core::{Kind, NewObservation, Observation};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Duration;
 
 /// In-memory int8 vector index. Populated lazily by callers via
 /// `Store::enable_vec_cache()`; daemons enable it at startup so vector
@@ -449,10 +450,11 @@ impl Store {
         Ok(rows)
     }
 
-    /// Rebuild the FTS index if it's dirty (an obs/chunk has been inserted or
-    /// deleted since the last rebuild). DuckDB FTS has no incremental update,
-    /// so we drop + recreate from scratch — ~4 s at 192k rows, which we
-    /// can't afford on every route handler call. The dirty bit gates it.
+    /// Rebuild the FTS index if dirty. Held for backward-compat with the
+    /// few call sites that still ask. The production daemon now uses a
+    /// background worker (see `spawn_fts_worker`) so the request path
+    /// doesn't pay the rebuild cost. The eval harness and tests still
+    /// call this synchronously since they don't have a worker thread.
     pub fn rebuild_fts(&self) -> Result<()> {
         let mut dirty = self.fts_dirty.lock().unwrap();
         if !*dirty {
@@ -465,9 +467,69 @@ impl Store {
     }
 
     /// Mark the FTS index stale. Callers that mutate `obs` or `code_chunks`
-    /// invoke this so the next `rebuild_fts` actually runs.
+    /// invoke this so the next rebuild actually runs.
     pub fn mark_fts_dirty(&self) {
         *self.fts_dirty.lock().unwrap() = true;
+    }
+
+    /// True if FTS has been marked dirty since the last successful rebuild.
+    /// Used by the background worker.
+    pub fn fts_is_dirty(&self) -> bool {
+        *self.fts_dirty.lock().unwrap()
+    }
+
+    /// Mark the FTS index clean. Only the background worker calls this,
+    /// after a successful rebuild on its own connection.
+    pub fn mark_fts_clean(&self) {
+        *self.fts_dirty.lock().unwrap() = false;
+    }
+
+    /// Clone the underlying DuckDB connection. Used to give the background
+    /// FTS worker its own handle so its long-running `PRAGMA create_fts_index`
+    /// doesn't serialize behind the route handlers' BM25 + vector reads.
+    /// DuckDB's MVCC keeps the two connections coherent.
+    pub fn clone_connection(&self) -> Result<Connection> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.try_clone()?)
+    }
+
+    /// Spawn a background thread that polls `fts_dirty` and rebuilds the
+    /// FTS index on its own DuckDB connection. The worker uses a separate
+    /// connection from the main `Store.conn` mutex, so its multi-second
+    /// `PRAGMA create_fts_index` runs concurrently with route-handler
+    /// queries — DuckDB's MVCC lets search snapshot the pre-rebuild FTS
+    /// state until the rebuild commits.
+    ///
+    /// The thread runs forever (until the process exits). For the personal
+    /// daemon use case we don't have a shutdown protocol; if you need one,
+    /// add an `Arc<AtomicBool>` shutdown flag.
+    pub fn spawn_fts_worker(store: Arc<Self>, poll_interval: Duration) -> Result<()> {
+        let bg_conn = store.clone_connection()?;
+        std::thread::Builder::new()
+            .name("memorize-fts-worker".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(poll_interval);
+                    if !store.fts_is_dirty() {
+                        continue;
+                    }
+                    let t = std::time::Instant::now();
+                    match bg_conn.execute_batch(crate::schema::fts_index_sql()) {
+                        Ok(_) => {
+                            store.mark_fts_clean();
+                            eprintln!(
+                                "memorize-store: fts rebuilt by worker in {:.1}s",
+                                t.elapsed().as_secs_f64()
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("memorize-store: fts worker rebuild failed: {e}");
+                            // Leave fts_dirty=true so the next tick retries.
+                        }
+                    }
+                }
+            })?;
+        Ok(())
     }
 
     pub fn count_obs(&self) -> Result<i64> {

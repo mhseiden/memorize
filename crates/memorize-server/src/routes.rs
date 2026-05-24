@@ -202,9 +202,8 @@ fn handle_capture(state: &ServerState, req: Request, payload: CaptureReq) -> Res
 }
 
 fn handle_recall(state: &ServerState, req: Request, payload: RecallReq) -> Result<()> {
-    // FTS index needs a rebuild after recent inserts before BM25 sees them.
-    // Cheap at our scale; we just do it on every recall.
-    let _ = state.store.rebuild_fts();
+    // FTS freshness is handled by the background worker (see
+    // `Store::spawn_fts_worker`); route handlers don't block on rebuilds.
     let emb = memorize_embed::embed(&payload.query).context("embed query")?;
     let results = recall(
         &state.store,
@@ -219,7 +218,6 @@ fn handle_context(state: &ServerState, req: Request, query: &str, budget: usize)
     if query.is_empty() {
         return respond_text(req, 200, "");
     }
-    let _ = state.store.rebuild_fts();
     let emb = memorize_embed::embed(query).context("embed context query")?;
     let results = recall(&state.store, query, &emb, 20)?;
 
@@ -266,7 +264,8 @@ fn handle_status(state: &ServerState, req: Request) -> Result<()> {
 }
 
 fn handle_code_search(state: &ServerState, req: Request, payload: CodeSearchReq) -> Result<()> {
-    let _ = state.store.rebuild_fts();
+    // FTS freshness is the background worker's job (see
+    // `Store::spawn_fts_worker`); we don't rebuild on the request path.
     let q = payload.query.trim();
     let scope_arg = payload.scope.as_deref().unwrap_or("current");
 
