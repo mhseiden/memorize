@@ -54,6 +54,10 @@ struct CodeSearchReq {
     language: Option<String>,
     #[serde(default)]
     path_prefix: Option<String>,
+    /// Caller's cwd, used to warn when the caller is operating outside the
+    /// indexed roots (`code_recall` won't find files from there).
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 /// Bind and serve. Blocks the calling thread; spawn before calling if you
@@ -77,10 +81,9 @@ pub fn serve(state: ServerState, bind: &str) -> Result<()> {
 
     let state = Arc::new(state);
 
-    // Background code indexer: cold-scan + watcher. Skipped if disabled.
-    if std::env::var("MEMORIZE_CODE_INDEX").as_deref() != Ok("0") {
-        crate::code_indexer::spawn(state.clone());
-    }
+    // Background code indexer: cold-scan + watcher. The thread checks its
+    // own `config.code_index.enabled` and exits cleanly if disabled.
+    crate::code_indexer::spawn(state.clone());
 
     for req in server.incoming_requests() {
         let st = state.clone();
@@ -98,6 +101,7 @@ fn handle(state: &ServerState, mut req: Request) -> Result<()> {
     let url = req.url().to_string();
     match (&method, url.as_str()) {
         (Method::Get, "/health") => respond_json(req, 200, &serde_json::json!({"ok": true})),
+        (Method::Get, "/status") => handle_status(state, req),
         (Method::Get, u) if u.starts_with("/context") => {
             // Context = recall over the query string args, formatted as markdown.
             let q = extract_query_param(u, "query").unwrap_or_default();
@@ -232,12 +236,40 @@ fn handle_context(state: &ServerState, req: Request, query: &str, budget: usize)
     respond_text(req, 200, &md)
 }
 
+fn handle_status(state: &ServerState, req: Request) -> Result<()> {
+    let indexer = state.indexer_status.snapshot();
+    let obs_count = state.store.count_obs().unwrap_or(-1);
+    let code_chunks = state.store.count_code_chunks().unwrap_or(-1);
+    let payload = serde_json::json!({
+        "ok": true,
+        "uptime_secs": state.indexer_status.server_uptime_secs(),
+        "obs_count": obs_count,
+        "code_chunks_count": code_chunks,
+        "config": {
+            "code_index": {
+                "enabled": state.config.code_index.enabled,
+                "roots": state.config.code_index.roots,
+                "languages": state.config.code_index.languages,
+                "respect_gitignore": state.config.code_index.respect_gitignore,
+                "max_file_bytes": state.config.code_index.max_file_bytes,
+            }
+        },
+        "indexer": indexer,
+    });
+    respond_json(req, 200, &payload)
+}
+
 fn handle_code_search(state: &ServerState, req: Request, payload: CodeSearchReq) -> Result<()> {
     // FTS index needs a rebuild if recent code chunks were written; cheap.
     let _ = state.store.rebuild_fts();
     let q = payload.query.trim();
+    let warnings = build_warnings(state, payload.cwd.as_deref());
     if q.is_empty() {
-        return respond_json(req, 200, &Vec::<serde_json::Value>::new());
+        return respond_json(
+            req,
+            200,
+            &serde_json::json!({"results": Vec::<serde_json::Value>::new(), "warnings": warnings}),
+        );
     }
     let limit = payload.limit.unwrap_or(10);
     let per_stream = 50usize;
@@ -273,7 +305,7 @@ fn handle_code_search(state: &ServerState, req: Request, payload: CodeSearchReq)
     let ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
     let rows = state.store.get_code_chunks_by_ids(&ids)?;
     let scores: Vec<f64> = fused.iter().map(|(_, s)| *s).collect();
-    let out: Vec<serde_json::Value> = rows
+    let results: Vec<serde_json::Value> = rows
         .into_iter()
         .zip(scores)
         .map(|(r, s)| {
@@ -290,7 +322,45 @@ fn handle_code_search(state: &ServerState, req: Request, payload: CodeSearchReq)
             })
         })
         .collect();
-    respond_json(req, 200, &out)
+    respond_json(
+        req,
+        200,
+        &serde_json::json!({"results": results, "warnings": warnings}),
+    )
+}
+
+/// Compute caller-relevant warnings to attach to a code-search response. The
+/// big one: if `cwd` was supplied and isn't under any indexed root, the agent
+/// is operating outside the index and won't find code from here.
+fn build_warnings(state: &ServerState, cwd: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    let cwd = match cwd {
+        Some(s) if !s.is_empty() => s,
+        _ => return out,
+    };
+    let cwd_path = std::path::Path::new(cwd);
+    let roots: Vec<std::path::PathBuf> = state
+        .config
+        .code_index
+        .roots
+        .iter()
+        .map(|s| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            if let Some(rest) = s.strip_prefix("~/") {
+                std::path::PathBuf::from(&home).join(rest)
+            } else {
+                std::path::PathBuf::from(s)
+            }
+        })
+        .collect();
+    if !roots.iter().any(|r| cwd_path.starts_with(r)) {
+        let roots_str: Vec<String> = roots.iter().map(|p| p.display().to_string()).collect();
+        out.push(format!(
+            "cwd ({cwd}) is not under any indexed root ({}). code_recall will not surface files from here. Add this path to `code_index.roots` in ~/.memorize/config.toml to index it.",
+            roots_str.join(", ")
+        ));
+    }
+    out
 }
 
 fn handle_syn(state: &ServerState, req: Request, payload: SynReq) -> Result<()> {

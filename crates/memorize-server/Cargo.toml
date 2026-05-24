@@ -17,3 +17,5 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 notify = "8.2.0"
 notify-debouncer-full = "0.7.0"
+toml = { workspace = true }
+ignore = { workspace = true }

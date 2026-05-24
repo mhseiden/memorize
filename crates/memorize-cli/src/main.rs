@@ -2,6 +2,7 @@ mod capture;
 mod client;
 mod config;
 mod install_hooks;
+mod install_launchd;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -42,6 +43,17 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Install a launchd user-agent so `memorize serve` auto-starts at login
+    /// and auto-restarts on crash. macOS only.
+    InstallLaunchd {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove the launchd user-agent installed by `install-launchd`.
+    UninstallLaunchd {
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Print server liveness + corpus size.
     Status,
     /// Run the MCP stdio server (Claude Code spawns this).
@@ -69,6 +81,8 @@ fn main() -> Result<()> {
         Cmd::Status => run_status(&cfg),
         Cmd::Syn { op } => run_syn(&cfg, op),
         Cmd::InstallHooks { dry_run } => install_hooks::run(&cfg, dry_run),
+        Cmd::InstallLaunchd { dry_run } => install_launchd::run(dry_run),
+        Cmd::UninstallLaunchd { dry_run } => install_launchd::uninstall(dry_run),
         Cmd::Mcp => {
             let http = format!("http://127.0.0.1:{}", cfg.port);
             memorize_mcp::run_stdio(&http)

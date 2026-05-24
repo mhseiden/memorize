@@ -46,6 +46,30 @@ pub fn run(cfg: &Config, dry_run: bool) -> Result<()> {
     let bin = which_memorize(cfg)?;
     eprintln!("memorize binary: {}", bin.display());
 
+    // 0. Drop a default config file on first install so users have something
+    //    to edit. Idempotent — existing configs are never touched.
+    if !dry_run {
+        match memorize_server::config::write_default_if_missing() {
+            Ok(true) => eprintln!(
+                "wrote default config to {}",
+                memorize_server::config::config_path().display()
+            ),
+            Ok(false) => {} // already exists; quiet
+            Err(e) => eprintln!("warning: couldn't write default config: {e}"),
+        }
+    }
+
+    // Surface the launchd hint when the agent isn't installed yet. We don't
+    // auto-install it (loading a launchd service is more invasive than the
+    // hook stubs we always write).
+    let launchd_plist = PathBuf::from(&home)
+        .join("Library/LaunchAgents/com.mhseiden.memorize.plist");
+    if !launchd_plist.exists() {
+        eprintln!();
+        eprintln!("tip: run `memorize install-launchd` to keep the daemon");
+        eprintln!("     running across reboots and crashes (recommended).");
+    }
+
     // 1. Write hook stub scripts.
     if !dry_run {
         std::fs::create_dir_all(&hooks_dir).context("create ~/.claude/hooks")?;

@@ -217,11 +217,19 @@ fn call_recall(args: &Value, http_url: &str) -> Result<Value, RpcError> {
         .unwrap_or(10);
 
     let body = json!({"query": query, "limit": limit}).to_string();
-    let resp = http_post(&format!("{http_url}/recall"), &body).map_err(|e| RpcError {
-        code: -32000,
-        message: format!("server unreachable: {e}"),
-    })?;
-    Ok(tool_result_text(&format_recall(&resp), false))
+    match http_post(&format!("{http_url}/recall"), &body) {
+        Ok(resp) => Ok(tool_result_text(&format_recall(&resp), false)),
+        Err(e) => {
+            let msg = e.to_string();
+            if classify_unreachable(&msg) {
+                // isError=true so the model sees the situation as an actionable
+                // tool failure rather than a protocol error.
+                Ok(tool_result_text(&unreachable_message(http_url), true))
+            } else {
+                Ok(tool_result_text(&format!("session_recall failed: {msg}"), true))
+            }
+        }
+    }
 }
 
 fn call_code_recall(args: &Value, http_url: &str) -> Result<Value, RpcError> {
@@ -240,30 +248,66 @@ fn call_code_recall(args: &Value, http_url: &str) -> Result<Value, RpcError> {
     if let Some(pp) = args.get("path_prefix").and_then(|v| v.as_str()) {
         body["path_prefix"] = json!(pp);
     }
-    let resp = http_post(&format!("{http_url}/code/search"), &body.to_string()).map_err(|e| {
-        RpcError {
-            code: -32000,
-            message: format!("server unreachable: {e}"),
+    // Pass the spawn-time cwd so the server can warn when we're outside the
+    // indexed roots. Claude Code launches the MCP shim from the project root.
+    if let Ok(cwd) = std::env::current_dir() {
+        body["cwd"] = json!(cwd.to_string_lossy());
+    }
+    match http_post(&format!("{http_url}/code/search"), &body.to_string()) {
+        Ok(resp) => Ok(tool_result_text(&format_code_recall(&resp), false)),
+        Err(e) => {
+            let msg = e.to_string();
+            if classify_unreachable(&msg) {
+                Ok(tool_result_text(&unreachable_message(http_url), true))
+            } else {
+                Ok(tool_result_text(&format!("code_recall failed: {msg}"), true))
+            }
         }
-    })?;
-    Ok(tool_result_text(&format_code_recall(&resp), false))
+    }
 }
 
 /// Render the code/search JSON response as compact markdown for the model.
+/// Server returns `{results: [...], warnings: [...]}`. Warnings (e.g. "your
+/// cwd is outside the indexed roots") are prepended so the model sees the
+/// situation before the results.
 fn format_code_recall(raw: &str) -> String {
     let parsed: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(_) => return raw.to_string(),
     };
-    let arr = match parsed.as_array() {
+    let results = parsed.get("results").and_then(|v| v.as_array());
+    let warnings = parsed.get("warnings").and_then(|v| v.as_array());
+    // Back-compat: bare array still accepted.
+    let arr = results.cloned().or_else(|| parsed.as_array().cloned());
+
+    let mut out = String::new();
+    if let Some(ws) = warnings {
+        for w in ws {
+            if let Some(s) = w.as_str() {
+                out.push_str(&format!("⚠ {s}\n"));
+            }
+        }
+        if !ws.is_empty() && results.is_some() {
+            out.push('\n');
+        }
+    }
+
+    let arr = match arr {
         Some(a) => a,
-        None => return raw.to_string(),
+        None => {
+            // Couldn't make sense of the shape — surface the raw text.
+            out.push_str(raw);
+            return out;
+        }
     };
     if arr.is_empty() {
-        return "(no code matches)".to_string();
+        if out.is_empty() {
+            return "(no code matches)".to_string();
+        }
+        out.push_str("(no code matches)\n");
+        return out;
     }
-    let mut out = String::new();
-    for hit in arr {
+    for hit in &arr {
         let path = hit.get("path").and_then(|v| v.as_str()).unwrap_or("?");
         let line_start = hit.get("line_start").and_then(|v| v.as_i64()).unwrap_or(0);
         let line_end = hit.get("line_end").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -338,6 +382,33 @@ fn http_post(url: &str, body: &str) -> Result<String> {
         .send_string(body)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(resp.into_string()?)
+}
+
+/// Distinguish "server isn't running" from other HTTP errors. ureq surfaces
+/// connection-refused as `Status(_, _)` for HTTP errors or `Transport(_)` for
+/// network-level failures. We only want to upgrade the message when the
+/// daemon itself isn't reachable — auth/4xx/5xx from a running server still
+/// flow through as generic errors.
+fn classify_unreachable(err_msg: &str) -> bool {
+    let s = err_msg.to_lowercase();
+    s.contains("connection refused")
+        || s.contains("connection reset")
+        || s.contains("connect error")
+        || s.contains("tcp connect error")
+        || s.contains("connection closed")
+        || s.contains("transport error")
+        || s.contains("os error 61") // ECONNREFUSED on macOS
+        || s.contains("dns")
+        || s.contains("timed out")
+}
+
+fn unreachable_message(http_url: &str) -> String {
+    format!(
+        "`memorize serve` is not running at {http_url}. \
+         Memory recall is unavailable until it's started. \
+         Start it with `memorize serve` (foreground) or load the launchd \
+         service: `launchctl load ~/Library/LaunchAgents/com.mhseiden.memorize.plist`."
+    )
 }
 
 #[cfg(test)]

@@ -3,8 +3,13 @@
 //! indexer that watches configured repo roots.
 
 pub mod code_indexer;
+pub mod config;
+pub mod indexer_log;
+pub mod indexer_status;
 pub mod routes;
 pub mod state;
 
+pub use config::{CodeIndexConfig, UserConfig};
+pub use indexer_status::{IndexerPhase, IndexerSnapshot, IndexerStatus};
 pub use routes::serve;
 pub use state::ServerState;
