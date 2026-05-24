@@ -57,6 +57,16 @@ enum Cmd {
     },
     /// Print server liveness + corpus size.
     Status,
+    /// Swap the embed model. Snapshots the DB, wipes the code index +
+    /// obs vectors, stamps the new model tag, then exits so the next
+    /// `memorize serve` cold-scans with whatever model the binary is
+    /// currently built for. Requires the daemon to be stopped — refuses
+    /// to run otherwise.
+    Reindex {
+        /// Destructive operation — must be passed explicitly.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Run the MCP stdio server (Claude Code spawns this).
     Mcp,
     /// Performance / memory profiling. Subcommands run isolated against an
@@ -135,6 +145,7 @@ fn main() -> Result<()> {
         Cmd::Recall { query, limit } => run_recall(&cfg, &query, limit),
         Cmd::Remember { text } => run_remember(&cfg, &text),
         Cmd::Status => run_status(&cfg),
+        Cmd::Reindex { confirm } => run_reindex(&cfg, confirm),
         Cmd::Syn { op } => run_syn(&cfg, op),
         Cmd::InstallHooks { dry_run } => install_hooks::run(&cfg, dry_run),
         Cmd::InstallLaunchd { dry_run } => install_launchd::run(dry_run),
@@ -241,5 +252,69 @@ fn run_status(cfg: &Config) -> Result<()> {
     println!("db_size:      {} bytes", db_size);
     println!("port:         {}", cfg.port);
     println!("token_budget: {}", cfg.token_budget);
+    Ok(())
+}
+
+fn run_reindex(cfg: &Config, confirm: bool) -> Result<()> {
+    use anyhow::Context as _;
+    use anyhow::bail;
+    let db = cfg.db_path();
+    if !db.exists() {
+        bail!("no database at {}", db.display());
+    }
+    // Refuse if the daemon is up — it holds the write lock and would
+    // overwrite our mutations.
+    if client::get(cfg, "/health").is_ok() {
+        bail!("daemon is running on port {}. stop it first (kill the `memorize serve` process), then re-run.", cfg.port);
+    }
+    if !confirm {
+        bail!(
+            "destructive: wipes the code index + obs vectors. re-run with `--confirm` to proceed.\n\
+             a snapshot of {} will be saved first.",
+            db.display()
+        );
+    }
+
+    let current = memorize_embed::model_tag();
+    eprintln!("--- reindex plan ---");
+    eprintln!("db:        {}", db.display());
+    eprintln!("new model: {current}");
+
+    // 1. Read the previous tag so we can put it in the snapshot filename
+    //    — at-a-glance you can tell which model each backup was for.
+    let store = memorize_store::Store::open(&db)
+        .with_context(|| format!("open {}", db.display()))?;
+    let prev_tag = store.stored_model_tag()?.unwrap_or_else(|| "untagged".into());
+    let chunk_count_before = store.count_code_chunks().unwrap_or(0);
+    eprintln!("prev tag:  {prev_tag}");
+
+    // 2. Snapshot the DB before mutating. Filename embeds the old model
+    //    tag so you can identify which snapshot belongs to which model
+    //    without having to open them.
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    // Sanitize the tag for safe use as a filename component.
+    let safe_tag: String = prev_tag
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .collect();
+    let backup = db.with_file_name(format!("db.duckdb.{safe_tag}-{ts}"));
+    // Drop the store handle first — DuckDB's write lock would block the
+    // `cp`, and we want a clean filesystem-level copy.
+    drop(store);
+    std::fs::copy(&db, &backup)
+        .with_context(|| format!("copy {} -> {}", db.display(), backup.display()))?;
+    let size_mb = std::fs::metadata(&backup).map(|m| m.len()).unwrap_or(0) as f64 / 1e6;
+    eprintln!("backup:    {} ({:.1} MB)", backup.display(), size_mb);
+
+    // 3. Re-open and apply the destructive ops.
+    let store = memorize_store::Store::open(&db)
+        .with_context(|| format!("re-open {} after snapshot", db.display()))?;
+    store.wipe_code_index()?;
+    store.set_model_tag(&current)?;
+    eprintln!(
+        "wiped:     {chunk_count_before} chunks + vectors + files rows. tagged DB with '{current}'."
+    );
+    eprintln!();
+    eprintln!("start the daemon (`memorize serve` or your launchd plist) to cold-scan with the new model.");
     Ok(())
 }

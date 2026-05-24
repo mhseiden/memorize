@@ -844,6 +844,67 @@ impl Store {
         }
     }
 
+    /// Read the embed-model identity persisted in the `meta` table. Returns
+    /// `None` if no value has been stamped yet (fresh DB, or pre-tagging
+    /// upgrade). Callers compare this against the binary's current
+    /// `memorize_embed::model_tag()` and refuse to start if they disagree
+    /// while vectors are present.
+    pub fn stored_model_tag(&self) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let row: std::result::Result<String, duckdb::Error> = conn.query_row(
+            "SELECT value FROM meta WHERE key = 'embed_model_tag'",
+            [],
+            |r| r.get(0),
+        );
+        match row {
+            Ok(s) => Ok(Some(s)),
+            Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Persist the embed-model identity into the `meta` table. Overwrites
+    /// any existing value — caller is responsible for asserting that the
+    /// vector tables are empty when changing models.
+    pub fn set_model_tag(&self, tag: &str) -> Result<()> {
+        let conn = self.write_conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('embed_model_tag', ?)
+             ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
+            params![tag],
+        )?;
+        Ok(())
+    }
+
+    /// Drop every code-index table (files, code_chunks, vec_code) and the
+    /// obs-side vector table (vec_chunks). Used by `memorize reindex` before
+    /// switching embed models. Leaves `obs` and `sessions` rows intact —
+    /// session memory text is preserved even though its vectors are gone,
+    /// and the watcher hooks will re-embed new captures with the new model.
+    pub fn wipe_code_index(&self) -> Result<()> {
+        let conn = self.write_conn.lock().unwrap();
+        conn.execute_batch(
+            "DELETE FROM vec_code;
+             DELETE FROM code_chunks;
+             DELETE FROM files;
+             DELETE FROM vec_chunks;",
+        )?;
+        drop(conn);
+        if let Some(cache_lock) = self.vec_cache.get() {
+            let mut cache = cache_lock.write().unwrap();
+            cache.ids.clear();
+            cache.vecs.clear();
+            cache.by_id.clear();
+        }
+        if let Some(cache_lock) = self.obs_vec_cache.get() {
+            let mut cache = cache_lock.write().unwrap();
+            cache.obs_ids.clear();
+            cache.vecs.clear();
+        }
+        self.mark_fts_dirty();
+        Ok(())
+    }
+
     /// Drop all chunks + vec rows for a deleted file.
     pub fn delete_code_file(&self, path: &str) -> Result<()> {
         let conn = self.write_conn.lock().unwrap();

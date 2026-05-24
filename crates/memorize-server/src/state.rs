@@ -23,6 +23,32 @@ pub struct ServerState {
 impl ServerState {
     pub fn new(db_path: PathBuf, token_budget: usize) -> Result<Self> {
         let store = Store::open(db_path)?;
+
+        // Validate the embed model matches whatever the vector tables were
+        // built with. Cross-model vectors are silently incoherent — same
+        // dim but different geometry, so cosine returns garbage rankings.
+        // We refuse to start in that state. To intentionally switch models,
+        // the operator runs `memorize reindex --confirm` which backs up
+        // the DB, wipes the code index, updates the tag, and lets the
+        // next startup cold-scan with the new model.
+        let current = memorize_embed::model_tag();
+        let stored = store.stored_model_tag()?;
+        let vectors_present = store.count_code_chunks()? > 0;
+        match stored.as_deref() {
+            Some(s) if s == current => {}
+            Some(s) if vectors_present => {
+                anyhow::bail!(
+                    "embed-model mismatch: vectors were built with '{s}' but binary is configured for '{current}'. \
+                     Either revert the binary or run `memorize reindex --confirm` to wipe + rebuild."
+                );
+            }
+            _ => {
+                // Empty corpus or first run after the tag column landed —
+                // stamp the current model and proceed.
+                store.set_model_tag(&current)?;
+            }
+        }
+
         // Hot vector recall lives in memory; ~5s startup, ~74MB resident,
         // ~3ms queries (vs ~80ms via DuckDB SQL int8 dot product).
         store.enable_vec_cache()?;
