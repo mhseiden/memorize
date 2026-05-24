@@ -593,6 +593,42 @@ impl Store {
         Ok(())
     }
 
+    /// Stream every (id, embedding) tuple from `vec_code` to `callback`.
+    /// Used by the eval's int8-quantization PoC, which converts each f32
+    /// vector to a packed i8 array at load time without keeping the full
+    /// f32 corpus in memory.
+    ///
+    /// We use `array_to_string` to serialize the FLOAT[N] column on the
+    /// SQL side and parse on the Rust side. DuckDB's Rust binding doesn't
+    /// implement `FromSql for Vec<f32>` directly; converting through its
+    /// `Value::Array` variant works but has per-element enum-dispatch
+    /// overhead. The string path is the practical workaround for one-time
+    /// bulk reads.
+    pub fn for_each_code_vector(
+        &self,
+        mut callback: impl FnMut(i64, &[f32]) -> Result<()>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, array_to_string(emb, ',') AS emb_str FROM vec_code",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut buf: Vec<f32> = Vec::with_capacity(self.embed_dim);
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let s: String = row.get(1)?;
+            buf.clear();
+            for tok in s.split(',') {
+                let f: f32 = tok
+                    .parse()
+                    .with_context(|| format!("parse emb component '{tok}'"))?;
+                buf.push(f);
+            }
+            callback(id, &buf)?;
+        }
+        Ok(())
+    }
+
     /// Sample N chunks at random, returning `(path, qualified)`. Used by the
     /// eval harness to build a synthetic query bank from the live index.
     /// Filters to rows with a non-trivial `qualified` so the symbol token

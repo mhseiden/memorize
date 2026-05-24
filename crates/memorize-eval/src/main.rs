@@ -68,6 +68,11 @@ enum Cmd {
         /// 0 to disable.
         #[arg(long, default_value_t = 200)]
         synthetic: usize,
+        /// Also evaluate int8-quantized vector modes (int8-only,
+        /// int8-hybrid). Adds ~5-10s startup to load + quantize the
+        /// in-memory index.
+        #[arg(long)]
+        int8: bool,
         /// Output directory for code-eval.md / code-eval.json.
         #[arg(long, default_value = "out")]
         out: PathBuf,
@@ -123,7 +128,7 @@ fn main() -> Result<()> {
             };
             harness::run(cfg, limit, &out, !no_cache)
         }
-        Cmd::CodeEval { db, bank, limit, synthetic, out } => {
+        Cmd::CodeEval { db, bank, limit, synthetic, int8, out } => {
             let db_path = db.unwrap_or_else(|| {
                 let home = std::env::var("HOME").expect("HOME unset");
                 PathBuf::from(home).join(".memorize/db.duckdb")
@@ -133,6 +138,7 @@ fn main() -> Result<()> {
                 bank_path: bank,
                 limit,
                 synthetic_count: synthetic,
+                include_int8: int8,
                 out_dir: out,
             })
         }
