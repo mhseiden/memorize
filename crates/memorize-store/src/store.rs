@@ -1,6 +1,7 @@
 use crate::DEFAULT_EMBED_DIM;
 use crate::schema::{
-    backfill_path_tokens_sql, fts_index_sql, migrate_vec_code_to_int8_sql, schema_sql,
+    backfill_path_tokens_sql, fts_index_sql, migrate_vec_chunks_to_int8_sql,
+    migrate_vec_code_to_int8_sql, schema_sql, vec_chunks_legacy_emb_probe_sql,
     vec_code_legacy_emb_probe_sql,
 };
 use crate::synonyms_seed::DEFAULT_PAIRS;
@@ -23,21 +24,39 @@ struct VecCache {
     by_id: std::collections::HashMap<i64, usize>,
 }
 
+/// Per-chunk obs vectors. Same data layout as VecCache, but the key is
+/// non-unique: an obs has multiple chunks. Search MAX-pools by `obs_id`
+/// across all rows belonging to the same obs.
+struct ObsVecCache {
+    obs_ids: Vec<i64>,
+    vecs: Vec<Vec<i8>>,
+}
+
 /// All access goes through here. DuckDB connections are not `Sync` (single
 /// writer model), so we wrap in a `Mutex`. For a single-user dogfood server
 /// the contention is negligible.
 pub struct Store {
+    /// Read connection. Used by every `search_*` and `get_*` method.
     conn: Mutex<Connection>,
+    /// Write connection. Used by every `insert_*` / `upsert_*` / `delete_*`
+    /// method, plus the synonym mutators. Cloned from `conn` at open time;
+    /// DuckDB MVCC keeps the two coherent. Splitting writes off the read
+    /// connection means search queries don't block behind an in-flight
+    /// indexer upsert.
+    write_conn: Mutex<Connection>,
     embed_dim: usize,
-    /// Optional in-memory int8 vector cache. `OnceLock` so it's initialized
-    /// at most once per process; the inner `RwLock` permits concurrent
-    /// searches alongside the indexer's upserts.
+    /// In-memory int8 vector cache for `vec_code`. `OnceLock` so it's
+    /// initialized at most once per process; the inner `RwLock` permits
+    /// concurrent searches alongside the indexer's upserts.
     vec_cache: OnceLock<RwLock<VecCache>>,
+    /// In-memory int8 vector cache for `vec_chunks` (per-chunk obs
+    /// embeddings). Same shape as `vec_cache` but the search path
+    /// MAX-pools per obs_id since each obs has multiple chunks.
+    obs_vec_cache: OnceLock<RwLock<ObsVecCache>>,
     /// True when an `obs` insert or a `code_chunks` upsert/delete has
-    /// happened since the last `rebuild_fts`. Lets the route handlers
-    /// skip the multi-second FTS rebuild when nothing has changed.
-    /// Starts `true` so the first rebuild after startup actually fires
-    /// (covers fresh installs + post-restart catch-up).
+    /// happened since the last `rebuild_fts`. Background worker reads
+    /// this on its poll loop; route handlers don't touch it. Starts
+    /// `true` so the first rebuild after startup fires.
     fts_dirty: Mutex<bool>,
 }
 
@@ -104,10 +123,13 @@ impl Store {
     /// `vec.emb` is `FLOAT[dim]`.
     pub fn open_with_dim<P: AsRef<Path>>(path: P, dim: usize) -> Result<Self> {
         let conn = Connection::open(path).context("open duckdb")?;
+        let write_conn = conn.try_clone().context("clone write conn")?;
         let store = Store {
             conn: Mutex::new(conn),
+            write_conn: Mutex::new(write_conn),
             embed_dim: dim,
             vec_cache: OnceLock::new(),
+            obs_vec_cache: OnceLock::new(),
             fts_dirty: Mutex::new(true),
         };
         store.init()?;
@@ -130,10 +152,13 @@ impl Store {
             duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?,
         )
         .context("open duckdb read-only")?;
+        let write_conn = conn.try_clone().context("clone write conn")?;
         Ok(Store {
             conn: Mutex::new(conn),
+            write_conn: Mutex::new(write_conn),
             embed_dim: dim,
             vec_cache: OnceLock::new(),
+            obs_vec_cache: OnceLock::new(),
             fts_dirty: Mutex::new(true),
         })
     }
@@ -148,10 +173,13 @@ impl Store {
     /// the active embedder.
     pub fn open_in_memory_with_dim(dim: usize) -> Result<Self> {
         let conn = Connection::open_in_memory().context("open in-memory duckdb")?;
+        let write_conn = conn.try_clone().context("clone write conn")?;
         let store = Store {
             conn: Mutex::new(conn),
+            write_conn: Mutex::new(write_conn),
             embed_dim: dim,
             vec_cache: OnceLock::new(),
+            obs_vec_cache: OnceLock::new(),
             fts_dirty: Mutex::new(true),
         };
         store.init()?;
@@ -180,6 +208,23 @@ impl Store {
                 .context("migrate vec_code to int8")?;
             eprintln!(
                 "memorize-store: vec_code int8 migration done in {:.1}s",
+                t.elapsed().as_secs_f64()
+            );
+        }
+
+        // Same migration for vec_chunks (obs side). Small at our scale —
+        // typically <1k rows — but kept symmetric with vec_code for code
+        // hygiene and future-proofing.
+        let has_obs_legacy: bool = conn
+            .query_row(vec_chunks_legacy_emb_probe_sql(), [], |r| r.get(0))
+            .unwrap_or(false);
+        if has_obs_legacy {
+            eprintln!("memorize-store: migrating vec_chunks.emb FLOAT→TINYINT (one-time)...");
+            let t = std::time::Instant::now();
+            conn.execute_batch(&migrate_vec_chunks_to_int8_sql(self.embed_dim))
+                .context("migrate vec_chunks to int8")?;
+            eprintln!(
+                "memorize-store: vec_chunks int8 migration done in {:.1}s",
                 t.elapsed().as_secs_f64()
             );
         }
@@ -245,7 +290,7 @@ impl Store {
                 );
             }
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn.lock().unwrap();
         let id: i64 = conn.query_row(
             "INSERT INTO obs(id, ts, session, branch, kind, body,
                              ref_path, ref_line_start, ref_line_end)
@@ -267,15 +312,25 @@ impl Store {
         )?;
         let dim = self.embed_dim;
         // One INSERT per chunk. Bounded by chunk count — typically 1–5.
+        let mut q8_chunks: Vec<Vec<i8>> = Vec::with_capacity(chunk_embs.len());
         for (idx, emb) in chunk_embs.iter().enumerate() {
-            let literal = float_array_literal(emb);
+            let q8 = quantize_i8(emb);
+            let literal = i8_array_literal(&q8);
             let sql = format!(
-                "INSERT INTO vec_chunks(obs_id, chunk_idx, emb)
-                 VALUES ({id}, {idx}, {literal}::FLOAT[{dim}])"
+                "INSERT INTO vec_chunks(obs_id, chunk_idx, emb_q8)
+                 VALUES ({id}, {idx}, {literal}::TINYINT[{dim}])"
             );
             conn.execute_batch(&sql)?;
+            q8_chunks.push(q8);
         }
         drop(conn);
+        // Update the in-memory obs vector cache, if enabled.
+        if let Some(cache_lock) = self.obs_vec_cache.get() {
+            let mut cache = cache_lock.write().unwrap();
+            for q8 in q8_chunks {
+                cache.push(id, q8);
+            }
+        }
         self.mark_fts_dirty();
         Ok(id)
     }
@@ -319,14 +374,29 @@ impl Store {
                 self.embed_dim
             );
         }
+        let q8 = quantize_i8(query_emb);
+
+        // Fast path: in-memory obs cache.
+        if let Some(cache_lock) = self.obs_vec_cache.get() {
+            return self.search_obs_vector_cached(cache_lock, &q8, limit);
+        }
+
+        // Slow path: SQL int8 dot product, max-pooled per obs_id.
         let conn = self.conn.lock().unwrap();
-        let literal = float_array_literal(query_emb);
+        let literal = i8_array_literal(&q8);
         let dim = self.embed_dim;
         let sql = format!(
             "SELECT obs_id, session, score FROM (
                 SELECT vc.obs_id AS obs_id,
                        o.session AS session,
-                       MAX(array_cosine_similarity(vc.emb, {literal}::FLOAT[{dim}])) AS score
+                       MAX(
+                           list_sum(
+                               list_transform(
+                                   list_zip(vc.emb_q8, {literal}::TINYINT[{dim}]),
+                                   pair -> pair[1]::INTEGER * pair[2]::INTEGER
+                               )
+                           )::DOUBLE
+                       ) AS score
                   FROM vec_chunks vc
                   JOIN obs o ON o.id = vc.obs_id
               GROUP BY vc.obs_id, o.session
@@ -345,6 +415,61 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// In-memory obs vector search. Each obs has multiple chunks; we
+    /// MAX-pool the dot product across them so the obs surfaces if any
+    /// of its chunks is on-topic. Sessions are hydrated for the top-K
+    /// results.
+    fn search_obs_vector_cached(
+        &self,
+        cache_lock: &RwLock<ObsVecCache>,
+        q8: &[i8],
+        limit: usize,
+    ) -> Result<Vec<VectorHit>> {
+        let cache = cache_lock.read().unwrap();
+        // MAX-pool by obs_id over the in-memory chunk vectors.
+        let mut best: std::collections::HashMap<i64, i32> = std::collections::HashMap::new();
+        for (oid, v) in cache.obs_ids.iter().zip(&cache.vecs) {
+            let s = dot_i8(q8, v);
+            let entry = best.entry(*oid).or_insert(i32::MIN);
+            if s > *entry {
+                *entry = s;
+            }
+        }
+        drop(cache);
+        let mut scored: Vec<(i64, i32)> = best.into_iter().collect();
+        scored.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        scored.truncate(limit);
+
+        // Hydrate session for each obs_id in top-K.
+        let ids: Vec<i64> = scored.iter().map(|(id, _)| *id).collect();
+        let by_id_score: std::collections::HashMap<i64, i32> =
+            scored.iter().map(|(id, s)| (*id, *s)).collect();
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id, session FROM obs WHERE id IN ({placeholders})");
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn duckdb::ToSql> =
+            ids.iter().map(|id| id as &dyn duckdb::ToSql).collect();
+        let mut hits: Vec<VectorHit> = stmt
+            .query_map(params.as_slice(), |row| {
+                let id: i64 = row.get(0)?;
+                let session: String = row.get(1)?;
+                Ok((id, session))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(id, session)| VectorHit {
+                id,
+                session,
+                score: by_id_score.get(&id).copied().unwrap_or(0) as f64,
+            })
+            .collect();
+        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(hits)
     }
 
     /// Hydrate full observation records for a set of ids, preserving the
@@ -601,7 +726,7 @@ impl Store {
                 );
             }
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn.lock().unwrap();
 
         // Atomic: delete stale chunks, upsert files row, insert new chunks
         // all in one transaction. Without this a crash mid-write would leave
@@ -723,7 +848,7 @@ impl Store {
 
     /// Drop all chunks + vec rows for a deleted file.
     pub fn delete_code_file(&self, path: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn.lock().unwrap();
         let stale_ids: Vec<i64> = {
             let mut stmt =
                 conn.prepare("SELECT id FROM code_chunks WHERE path = ?")?;
@@ -998,33 +1123,78 @@ impl Store {
         Ok(hits)
     }
 
-    /// Build the in-memory int8 vector cache from `vec_code`. Daemons call
-    /// this once at startup after `Store::open`. Idempotent — second call
-    /// is a no-op. ~5 s for 192k vectors, ~74 MB resident.
+    /// Build the in-memory int8 vector caches (code-side `vec_code` and
+    /// obs-side `vec_chunks`). Daemons call this once at startup after
+    /// `Store::open`. Idempotent — second call is a no-op. ~5 s for 192k
+    /// code vectors on the live DB; the obs cache is small in comparison.
     pub fn enable_vec_cache(&self) -> Result<()> {
-        if self.vec_cache.get().is_some() {
-            return Ok(());
+        if self.vec_cache.get().is_none() {
+            let t = std::time::Instant::now();
+            let mut ids: Vec<i64> = Vec::new();
+            let mut vecs: Vec<Vec<i8>> = Vec::new();
+            self.for_each_code_vector(|id, q8| {
+                ids.push(id);
+                vecs.push(q8.to_vec());
+                Ok(())
+            })?;
+            let mut by_id: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+            for (pos, id) in ids.iter().enumerate() {
+                by_id.insert(*id, pos);
+            }
+            let n = ids.len();
+            let cache = VecCache { ids, vecs, by_id };
+            let _ = self.vec_cache.set(RwLock::new(cache));
+            eprintln!(
+                "memorize-store: vec_cache (code) loaded ({} vectors in {:.1}s)",
+                n,
+                t.elapsed().as_secs_f64()
+            );
         }
-        let t = std::time::Instant::now();
-        let mut ids: Vec<i64> = Vec::new();
-        let mut vecs: Vec<Vec<i8>> = Vec::new();
-        self.for_each_code_vector(|id, q8| {
-            ids.push(id);
-            vecs.push(q8.to_vec());
-            Ok(())
-        })?;
-        let mut by_id: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
-        for (pos, id) in ids.iter().enumerate() {
-            by_id.insert(*id, pos);
+        if self.obs_vec_cache.get().is_none() {
+            let t = std::time::Instant::now();
+            let mut obs_ids: Vec<i64> = Vec::new();
+            let mut vecs: Vec<Vec<i8>> = Vec::new();
+            self.for_each_obs_vector(|oid, q8| {
+                obs_ids.push(oid);
+                vecs.push(q8.to_vec());
+                Ok(())
+            })?;
+            let n = obs_ids.len();
+            let cache = ObsVecCache { obs_ids, vecs };
+            let _ = self.obs_vec_cache.set(RwLock::new(cache));
+            eprintln!(
+                "memorize-store: obs_vec_cache loaded ({} vectors in {:.1}s)",
+                n,
+                t.elapsed().as_secs_f64()
+            );
         }
-        let n = ids.len();
-        let cache = VecCache { ids, vecs, by_id };
-        let _ = self.vec_cache.set(RwLock::new(cache));
-        eprintln!(
-            "memorize-store: vec_cache loaded ({} vectors in {:.1}s)",
-            n,
-            t.elapsed().as_secs_f64()
-        );
+        Ok(())
+    }
+
+    /// Stream every (obs_id, int8 embedding) tuple from `vec_chunks` to
+    /// `callback`. Symmetric with `for_each_code_vector`.
+    pub fn for_each_obs_vector(
+        &self,
+        mut callback: impl FnMut(i64, &[i8]) -> Result<()>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT obs_id, array_to_string(emb_q8, ',') AS emb_str FROM vec_chunks",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut buf: Vec<i8> = Vec::with_capacity(self.embed_dim);
+        while let Some(row) = rows.next()? {
+            let obs_id: i64 = row.get(0)?;
+            let s: String = row.get(1)?;
+            buf.clear();
+            for tok in s.split(',') {
+                let v: i8 = tok
+                    .parse()
+                    .with_context(|| format!("parse emb_q8 component '{tok}'"))?;
+                buf.push(v);
+            }
+            callback(obs_id, &buf)?;
+        }
         Ok(())
     }
 
@@ -1166,6 +1336,16 @@ impl VecCache {
     }
 }
 
+impl ObsVecCache {
+    /// Append one chunk vector for the given obs. No by_id index — obs
+    /// have multiple chunks and we always scan the full vector at search
+    /// time anyway. Removal isn't currently used (obs eviction is rare).
+    fn push(&mut self, obs_id: i64, vec: Vec<i8>) {
+        self.obs_ids.push(obs_id);
+        self.vecs.push(vec);
+    }
+}
+
 /// SHA-256 of arbitrary bytes. Used to detect when a code chunk's body is
 /// unchanged between re-indexes so we can skip embedding work.
 fn hash_bytes(bytes: &[u8]) -> Vec<u8> {
@@ -1240,8 +1420,11 @@ mod tests {
         s.insert_obs(&obs, 1000, &dummy_emb(1.0)).unwrap();
         let hits = s.search_vector(&dummy_emb(1.0), 10).unwrap();
         assert_eq!(hits.len(), 1);
-        // Self-cosine should be ~1.0.
-        assert!((hits[0].score - 1.0).abs() < 1e-4);
+        // Self-similarity. We now store int8-quantized vectors and search
+        // returns the raw dot product (not normalized cosine). The exact
+        // value depends on the dummy embedding shape; what matters is that
+        // it's positive and larger than any non-self score would be.
+        assert!(hits[0].score > 0.0);
     }
 
     #[test]

@@ -36,12 +36,16 @@ CREATE TABLE IF NOT EXISTS sessions (
 -- group-by-obs max(score) as the vector contribution. BM25 still indexes
 -- the full body in obs.body, so we get full-body lexical recall plus
 -- chunk-level semantic recall in the same pipeline.
+--
+-- Int8-quantized; see `migrate_vec_chunks_to_int8_sql` for the FLOAT→TINYINT
+-- migration that fires on older DBs.
 CREATE TABLE IF NOT EXISTS vec_chunks (
     obs_id    BIGINT  NOT NULL,
     chunk_idx INTEGER NOT NULL,
-    emb       FLOAT[{dim}] NOT NULL,
+    emb_q8    TINYINT[{dim}] NOT NULL,
     PRIMARY KEY (obs_id, chunk_idx)
 );
+ALTER TABLE vec_chunks ADD COLUMN IF NOT EXISTS emb_q8 TINYINT[{dim}];
 
 -- Retained for backward-compat with existing DBs from Phase 1–3. New
 -- inserts go into vec_chunks; legacy single-vector rows in `vec` are
@@ -172,6 +176,32 @@ pub fn vec_code_legacy_emb_probe_sql() -> &'static str {
     "SELECT count(*) > 0
        FROM duckdb_columns
       WHERE table_name = 'vec_code' AND column_name = 'emb'"
+}
+
+/// Same migration as `migrate_vec_code_to_int8_sql` but for `vec_chunks`
+/// (per-chunk embeddings on the obs side). Idempotent: gated by
+/// `vec_chunks_legacy_emb_probe_sql` so it only fires on DBs that still
+/// have the legacy column.
+pub fn migrate_vec_chunks_to_int8_sql(dim: usize) -> String {
+    format!(
+        r#"
+SET lambda_syntax='ENABLE_SINGLE_ARROW';
+UPDATE vec_chunks
+   SET emb_q8 = CAST(
+       list_transform(emb, x -> CAST(ROUND(x * 127) AS TINYINT))
+       AS TINYINT[{dim}]
+   )
+ WHERE emb_q8 IS NULL;
+ALTER TABLE vec_chunks DROP COLUMN IF EXISTS emb;
+"#,
+        dim = dim
+    )
+}
+
+pub fn vec_chunks_legacy_emb_probe_sql() -> &'static str {
+    "SELECT count(*) > 0
+       FROM duckdb_columns
+      WHERE table_name = 'vec_chunks' AND column_name = 'emb'"
 }
 
 /// Force-recompute `path_tokens` on store init. Cheap at our scale (~84k
