@@ -447,78 +447,96 @@ impl Store {
         }
         let conn = self.conn.lock().unwrap();
 
-        // Remove any existing chunks for this path; their ids are stale.
-        let stale_ids: Vec<i64> = {
-            let mut stmt =
-                conn.prepare("SELECT id FROM code_chunks WHERE path = ?")?;
-            let rows = stmt.query_map(params![path], |row| row.get::<_, i64>(0))?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        if !stale_ids.is_empty() {
-            let placeholders: String =
-                stale_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let del_chunks = format!("DELETE FROM code_chunks WHERE id IN ({placeholders})");
-            let del_vec = format!("DELETE FROM vec_code WHERE id IN ({placeholders})");
-            let params_vec: Vec<&dyn duckdb::ToSql> =
-                stale_ids.iter().map(|id| id as &dyn duckdb::ToSql).collect();
-            conn.execute(&del_chunks, params_vec.as_slice())?;
-            conn.execute(&del_vec, params_vec.as_slice())?;
-        }
+        // Atomic: delete stale chunks, upsert files row, insert new chunks
+        // all in one transaction. Without this a crash mid-write would leave
+        // the files row pointing at a fresh mtime/size while the chunk set
+        // is partial — on restart `get_file_meta` would falsely report
+        // "already indexed" and skip the file forever.
+        conn.execute_batch("BEGIN")?;
+        let res: Result<()> = (|| {
+            let stale_ids: Vec<i64> = {
+                let mut stmt =
+                    conn.prepare("SELECT id FROM code_chunks WHERE path = ?")?;
+                let rows = stmt.query_map(params![path], |row| row.get::<_, i64>(0))?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            if !stale_ids.is_empty() {
+                let placeholders: String =
+                    stale_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let del_chunks =
+                    format!("DELETE FROM code_chunks WHERE id IN ({placeholders})");
+                let del_vec =
+                    format!("DELETE FROM vec_code WHERE id IN ({placeholders})");
+                let params_vec: Vec<&dyn duckdb::ToSql> =
+                    stale_ids.iter().map(|id| id as &dyn duckdb::ToSql).collect();
+                conn.execute(&del_chunks, params_vec.as_slice())?;
+                conn.execute(&del_vec, params_vec.as_slice())?;
+            }
 
-        // Upsert files row.
-        conn.execute(
-            "INSERT INTO files(path, repo_root, language, mtime_ns, size_bytes, git_rev)
-                  VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(path) DO UPDATE SET
-                repo_root = EXCLUDED.repo_root,
-                language = EXCLUDED.language,
-                mtime_ns = EXCLUDED.mtime_ns,
-                size_bytes = EXCLUDED.size_bytes,
-                git_rev = EXCLUDED.git_rev",
-            params![
-                path,
-                repo_root,
-                language,
-                meta.mtime_ns,
-                meta.size_bytes,
-                meta.git_rev
-            ],
-        )?;
-
-        // Allocate ids and insert chunks + embeddings.
-        let base: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(id), 0) FROM code_chunks",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        let dim = self.embed_dim;
-        for (i, c) in chunks.iter().enumerate() {
-            let id = base + 1 + i as i64;
             conn.execute(
-                "INSERT INTO code_chunks(id, path, language, line_start, line_end,
-                                         kind, qualified, body, body_hash)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO files(path, repo_root, language, mtime_ns, size_bytes, git_rev)
+                      VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(path) DO UPDATE SET
+                    repo_root = EXCLUDED.repo_root,
+                    language = EXCLUDED.language,
+                    mtime_ns = EXCLUDED.mtime_ns,
+                    size_bytes = EXCLUDED.size_bytes,
+                    git_rev = EXCLUDED.git_rev",
                 params![
-                    id,
                     path,
-                    c.language,
-                    c.line_start,
-                    c.line_end,
-                    c.kind,
-                    c.qualified,
-                    c.body,
-                    hash_bytes(c.body.as_bytes()),
+                    repo_root,
+                    language,
+                    meta.mtime_ns,
+                    meta.size_bytes,
+                    meta.git_rev
                 ],
             )?;
-            let literal = float_array_literal(&chunk_embs[i]);
-            let insert_vec = format!(
-                "INSERT INTO vec_code(id, emb) VALUES ({id}, {literal}::FLOAT[{dim}])"
-            );
-            conn.execute_batch(&insert_vec)?;
+
+            let base: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(id), 0) FROM code_chunks",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let dim = self.embed_dim;
+            for (i, c) in chunks.iter().enumerate() {
+                let id = base + 1 + i as i64;
+                conn.execute(
+                    "INSERT INTO code_chunks(id, path, language, line_start, line_end,
+                                             kind, qualified, body, body_hash)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        id,
+                        path,
+                        c.language,
+                        c.line_start,
+                        c.line_end,
+                        c.kind,
+                        c.qualified,
+                        c.body,
+                        hash_bytes(c.body.as_bytes()),
+                    ],
+                )?;
+                let literal = float_array_literal(&chunk_embs[i]);
+                let insert_vec = format!(
+                    "INSERT INTO vec_code(id, emb) VALUES ({id}, {literal}::FLOAT[{dim}])"
+                );
+                conn.execute_batch(&insert_vec)?;
+            }
+            Ok(())
+        })();
+
+        match res {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
         }
-        Ok(())
     }
 
     /// Drop all chunks + vec rows for a deleted file.

@@ -79,7 +79,7 @@ mod tests {
     use memorize_store::DEFAULT_EMBED_DIM as EMBED_DIM;
 
     /// Synthetic fixed-pattern embeddings so cosine ranking is predictable
-    /// without invoking fastembed in tests.
+    /// without invoking the real embedder in tests.
     fn synth_emb(seed: u32) -> Vec<f32> {
         let mut v = vec![0.0f32; EMBED_DIM];
         for (i, x) in v.iter_mut().enumerate() {

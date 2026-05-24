@@ -5,7 +5,9 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-fastembed = { workspace = true }
-ort = { workspace = true }
-anyhow = { workspace = true }
+# llama-cpp-2 wraps llama.cpp. On macOS the `metal` feature compiles the Metal
+# shader kernels into the build, so MiniLM runs on the GPU.
+llama-cpp-2 = { version = "0.1.146", default-features = false, features = ["metal"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
 tokenizers = { workspace = true }
+anyhow = { workspace = true }

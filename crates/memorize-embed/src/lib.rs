@@ -1,277 +1,323 @@
-//! Text embeddings via `fastembed` 5.x.
+//! Text embeddings via llama.cpp (`llama-cpp-2`). MiniLM on Metal on macOS.
 //!
-//! Model selection (default: `AllMiniLML6V2` — fp32):
+//! Model: `sentence-transformers/all-MiniLM-L6-v2` packaged as GGUF (downloaded
+//! from `leliuga/all-MiniLM-L6-v2-GGUF` on first call, cached under
+//! `~/.cache/huggingface/hub`). Override the GGUF source via env:
 //!
 //! ```text
-//! MEMORIZE_EMBED_MODEL = minilm | minilm-q | gte-large | jina-code
+//! MEMORIZE_EMBED_GGUF_REPO = "leliuga/all-MiniLM-L6-v2-GGUF"
+//! MEMORIZE_EMBED_GGUF_FILE = "all-MiniLM-L6-v2.F32.gguf"
 //! ```
 //!
-//! `minilm-q` is the INT8 quantized variant. The cited 2–4× CPU speedup is
-//! x86+VNNI only — measured on M4 Pro / ORT 2.0-rc.12, INT8 was ~15% **slower**
-//! than fp32 because ORT's ARM kernels fall back to emulated INT8. Stay on fp32
-//! unless running on x86 with VNNI.
+//! # Batching: just pass everything, llama.cpp schedules
 //!
-//! See `README.md` in this crate for the backend-selection history (Candle
-//! Metal / Accelerate, INT8 quantization, CoreML EP) and why fastembed/ORT
-//! CPU is the local ceiling on Apple Silicon.
+//! Callers do **not** need to chunk inputs into smaller batches before
+//! calling `embed_batch`. Pass all N chunks of a file in one call. Inside
+//! `decode()`, llama.cpp splits the work into ubatches of size `n_ubatch`
+//! and runs them sequentially on the Metal command queue — that's the
+//! scheduler we want, not one we should reimplement. Manually loop-calling
+//! `embed()` per chunk costs an extra Rust↔Metal dispatch per item with no
+//! upside.
 //!
-//! Other knobs:
-//! - `MEMORIZE_MODEL_DIR`: override the ONNX cache directory (default `~/.memorize/models`).
+//! There IS a throughput-vs-batch-size curve (peak at batch=4 for MiniLM on
+//! M-series, monotonic decline past batch=16 because padding waste eats
+//! GPU utilization). But that's a question of which call-site batch size
+//! is optimal, not whether we should fan out inside this crate. The
+//! production indexer batches per-file (median ~6 chunks, naturally in the
+//! peak zone); cross-file batching has been measured and doesn't help. See
+//! `README.md` for the curve.
 //!
-//! CoreML execution provider on macOS is **opt-in** via `MEMORIZE_EMBED_COREML=1`.
-//! Measured results on macOS 15 / M4 Pro / ort 2.0-rc.12:
-//!
-//!  - **MiniLM**: compiles cleanly under MLProgram, but inference is ~10×
-//!    slower than CPU EP (11s/q vs 1.2s/q). Cause is well-documented: ORT's
-//!    CoreML EP fragments transformer graphs into many CPU/ANE regions,
-//!    and the per-batch memory marshaling + dynamic-shape reshape overhead
-//!    dominates at our small batch size and model size.
-//!  - **GTE-Large**: fails to compile (CoreML rejects unsupported ops with
-//!    error -7).
-//!  - **Jina-Code**: untested, same architecture family as the other two.
-//!
-//! Configured for opt-in use anyway with:
-//!  - MLProgram backend (legacy NeuralNetwork crashes on macOS 14+).
-//!  - `with_model_cache_dir` so successive process spawns reuse the compile.
-//!  - `SpecializationStrategy::FastPrediction` for inference latency over
-//!    specialization time.
-//!  - `MEMORIZE_EMBED_COREML_UNITS={all,ane,gpu,cpu}` to vary hardware target.
-//!  - `MEMORIZE_EMBED_COREML_PROFILE=1` to log per-op dispatch — the ORT-
-//!    recommended diagnostic when perf is unexpected.
+//! See `README.md` for the full backend-selection history (Candle, MLX,
+//! INT8 quantization, CoreML EP) and why llama.cpp+Metal won.
 
-use anyhow::{Context, Result, bail};
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
-use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use anyhow::{Context, Result, anyhow, bail};
+use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
+use llama_cpp_2::context::LlamaContext;
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::{AddBos, LlamaModel};
+use std::cell::RefCell;
+use std::sync::OnceLock;
 use tokenizers::Tokenizer;
 
-#[derive(Debug, Clone)]
-struct Choice {
-    model: EmbeddingModel,
-    tag: &'static str,
-    dim: usize,
+const REPO_GGUF: &str = "leliuga/all-MiniLM-L6-v2-GGUF";
+const FILE_GGUF: &str = "all-MiniLM-L6-v2.F32.gguf";
+const REPO_TOKENIZER: &str = "sentence-transformers/all-MiniLM-L6-v2";
+
+// llama.cpp requires backend init exactly once per process.
+static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+// Model lives for the process; LlamaContext borrows from it. By holding it in
+// a OnceLock we get a 'static reference safe to share across threads
+// (LlamaModel is Send+Sync).
+static MODEL: OnceLock<LlamaModel> = OnceLock::new();
+// LlamaContext is !Send (holds a NonNull). Stash one per thread instead of a
+// global Mutex; the indexer is single-threaded and the HTTP server gets one
+// context per worker, which is what we want anyway.
+thread_local! {
+    static CTX: RefCell<Option<LlamaContext<'static>>> = const { RefCell::new(None) };
 }
-
-const MINILM: Choice = Choice {
-    model: EmbeddingModel::AllMiniLML6V2,
-    tag: "all-minilm-l6-v2",
-    dim: 384,
-};
-const MINILM_Q: Choice = Choice {
-    model: EmbeddingModel::AllMiniLML6V2Q,
-    tag: "all-minilm-l6-v2-q",
-    dim: 384,
-};
-const GTE_LARGE: Choice = Choice {
-    model: EmbeddingModel::GTELargeENV15,
-    tag: "gte-large-en-v1.5",
-    dim: 1024,
-};
-const JINA_CODE: Choice = Choice {
-    model: EmbeddingModel::JinaEmbeddingsV2BaseCode,
-    tag: "jina-embeddings-v2-base-code",
-    dim: 768,
-};
-
-static CHOICE: OnceLock<Choice> = OnceLock::new();
-static EMBEDDER: OnceLock<Mutex<TextEmbedding>> = OnceLock::new();
-/// Tokenizer used for token-cap accounting. Loaded independently of the
-/// (heavier) `TextEmbedding` model; callers that just need to size inputs
-/// don't pay the ONNX initialization cost.
+// HF-shaped tokenizer for the chunk-cap splitter. Much faster per-call than
+// model.str_to_token; both share the MiniLM WordPiece vocab so counts agree.
 static TOKENIZER: OnceLock<Tokenizer> = OnceLock::new();
 
-fn resolve_choice() -> Choice {
-    match std::env::var("MEMORIZE_EMBED_MODEL")
-        .unwrap_or_else(|_| "minilm".to_string())
-        .to_lowercase()
-        .as_str()
-    {
-        "minilm" | "all-minilm-l6-v2" | "" => MINILM,
-        "minilm-q" | "all-minilm-l6-v2-q" => MINILM_Q,
-        "gte-large" | "gte-large-en-v1.5" => GTE_LARGE,
-        "jina-code" | "jina-embeddings-v2-base-code" => JINA_CODE,
-        other => panic!(
-            "MEMORIZE_EMBED_MODEL={other:?} is not recognized. Use minilm-q | minilm | gte-large | jina-code."
-        ),
-    }
+fn repo_gguf() -> String {
+    std::env::var("MEMORIZE_EMBED_GGUF_REPO").unwrap_or_else(|_| REPO_GGUF.to_string())
 }
 
-fn cache_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("MEMORIZE_MODEL_DIR") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".memorize").join("models")
+fn file_gguf() -> String {
+    std::env::var("MEMORIZE_EMBED_GGUF_FILE").unwrap_or_else(|_| FILE_GGUF.to_string())
 }
 
-fn current() -> &'static Choice {
-    CHOICE.get_or_init(resolve_choice)
+fn hf_api() -> Result<hf_hub::api::sync::Api> {
+    hf_hub::api::sync::ApiBuilder::new()
+        .build()
+        .context("hf-hub init")
 }
 
-pub fn model_tag() -> &'static str {
-    current().tag
+fn ensure_backend() -> Result<&'static LlamaBackend> {
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+    let mut b = LlamaBackend::init().context("init llama backend")?;
+    // Silence llama.cpp's stderr chatter (per-call lines like "decode: cannot
+    // decode batches with this context (calling encode() instead)", model
+    // load dumps, etc.). Set `MEMORIZE_EMBED_VERBOSE=1` to keep them.
+    if std::env::var("MEMORIZE_EMBED_VERBOSE").ok().as_deref() != Some("1") {
+        b.void_logs();
+    }
+    let _ = BACKEND.set(b);
+    Ok(BACKEND.get().expect("just set"))
 }
 
-pub fn embedding_dim() -> usize {
-    current().dim
+fn ensure_model() -> Result<&'static LlamaModel> {
+    if let Some(m) = MODEL.get() {
+        return Ok(m);
+    }
+    let backend = ensure_backend()?;
+    let api = hf_api()?;
+    let model_path = api
+        .model(repo_gguf())
+        .get(&file_gguf())
+        .with_context(|| format!("download GGUF {}", file_gguf()))?;
+    // 1000 = "all layers" — MiniLM has 6 transformer blocks, well under.
+    let params = LlamaModelParams::default().with_n_gpu_layers(1000);
+    let model = LlamaModel::load_from_file(backend, &model_path, &params)
+        .with_context(|| format!("load GGUF {}", model_path.display()))?;
+    let _ = MODEL.set(model);
+    Ok(MODEL.get().expect("just set"))
 }
 
-fn ensure_init() -> Result<&'static Mutex<TextEmbedding>> {
-    if let Some(e) = EMBEDDER.get() {
-        return Ok(e);
-    }
-    let choice = current();
-    let dir = cache_dir();
-    std::fs::create_dir_all(&dir).context("create model cache dir")?;
+/// llama.cpp hard cap on n_seq_max is 256. We don't need this many sequences
+/// per `decode()` call in practice; partitioning happens above this anyway.
+const N_SEQ_MAX: u32 = 256;
 
-    let mut options = TextInitOptions::new(choice.model.clone())
-        .with_cache_dir(dir.clone())
-        .with_show_download_progress(false);
-
-    // CoreML EP — opt-in. MLProgram backend, per-model on-disk compile
-    // cache, FastPrediction specialization. See module docs for the
-    // measured tradeoffs.
-    #[cfg(target_os = "macos")]
-    if std::env::var("MEMORIZE_EMBED_COREML").as_deref() == Ok("1") {
-        use ort::ep::coreml::{CoreML, ComputeUnits, ModelFormat, SpecializationStrategy};
-        let cache = dir.join("coreml-cache");
-        std::fs::create_dir_all(&cache).ok();
-        let profile =
-            std::env::var("MEMORIZE_EMBED_COREML_PROFILE").as_deref() == Ok("1");
-        let compute_units = match std::env::var("MEMORIZE_EMBED_COREML_UNITS")
-            .as_deref()
-            .unwrap_or("all")
-        {
-            "ane" | "cpu_ane" => ComputeUnits::CPUAndNeuralEngine,
-            "gpu" | "cpu_gpu" => ComputeUnits::CPUAndGPU,
-            "cpu" => ComputeUnits::CPUOnly,
-            _ => ComputeUnits::All,
-        };
-        options = options.with_execution_providers(vec![
-            CoreML::default()
-                .with_model_format(ModelFormat::MLProgram)
-                .with_model_cache_dir(cache.display().to_string())
-                .with_specialization_strategy(SpecializationStrategy::FastPrediction)
-                .with_compute_units(compute_units)
-                .with_profile_compute_plan(profile)
-                .build(),
-        ]);
-    }
-
-    let model = TextEmbedding::try_new(options)
-        .with_context(|| format!("init embedder for {}", choice.tag))?;
-    let _ = EMBEDDER.set(Mutex::new(model));
-    Ok(EMBEDDER.get().expect("just set"))
+/// Total tokens we'll feed llama.cpp in a single `decode()` call. Sized to
+/// fit the Metal compute buffer comfortably on M-series — larger values
+/// caused `kIOGPUCommandBufferCallbackErrorOutOfMemory` mid-scan, which
+/// poisons the context. `embed_batch` partitions the caller's input into
+/// sub-batches that each fit here, so callers still pass everything in one
+/// call.
+///
+/// Override via `MEMORIZE_EMBED_N_BATCH` for benchmarking only.
+fn n_batch_cap() -> u32 {
+    std::env::var("MEMORIZE_EMBED_N_BATCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8192)
 }
 
-/// Embed a single string. Inputs exceeding the model's max-token window are
-/// silently truncated by the tokenizer (model-dependent: MiniLM = 512,
-/// GTE-Large and Jina-Code = 8192).
-pub fn embed(text: &str) -> Result<Vec<f32>> {
-    let m = ensure_init()?;
-    let mut lock = m.lock().expect("embedder mutex poisoned");
-    let mut out = lock.embed(vec![text], None).context("embed")?;
-    let v = out.pop().expect("embed returned empty Vec");
-    let expected = current().dim;
-    if v.len() != expected {
-        bail!(
-            "embedding dim {} doesn't match expected {} for {}",
-            v.len(),
-            expected,
-            current().tag
-        );
-    }
-    Ok(v)
-}
-
-/// Batch embedding. Single ONNX inference for all inputs.
-pub fn embed_batch(texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-    if texts.is_empty() {
-        return Ok(vec![]);
-    }
-    let m = ensure_init()?;
-    let mut lock = m.lock().expect("embedder mutex poisoned");
-    let out = lock.embed(texts.to_vec(), None).context("embed batch")?;
-    let expected = current().dim;
-    if let Some(v) = out.first() {
-        if v.len() != expected {
-            bail!(
-                "embedding dim {} doesn't match expected {} for {}",
-                v.len(),
-                expected,
-                current().tag
-            );
-        }
-    }
-    Ok(out)
-}
-
-/// Max sequence length accepted by the current embedding model. Anything
-/// longer is silently truncated inside the tokenizer/model — callers can
-/// avoid that by re-splitting with [`split_to_token_cap`] first.
-pub fn max_seq_tokens() -> usize {
-    // MiniLM and Jina-code both ship with 512 in the model config. GTE-Large
-    // is 512 too despite the model architecture supporting more.
-    match current().tag {
-        "all-minilm-l6-v2" | "all-minilm-l6-v2-q" => 512,
-        "gte-large-en-v1.5" => 512,
-        "jina-embeddings-v2-base-code" => 8192,
-        _ => 512,
-    }
+fn build_context() -> Result<LlamaContext<'static>> {
+    let backend = ensure_backend()?;
+    let model = ensure_model()?;
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(4);
+    let n_batch = n_batch_cap();
+    let params = LlamaContextParams::default()
+        .with_embeddings(true)
+        .with_n_threads_batch(threads)
+        .with_n_seq_max(N_SEQ_MAX)
+        .with_n_batch(n_batch)
+        .with_n_ubatch(n_batch)
+        // Mean-pool matches sentence-transformers on top of MiniLM. Models that
+        // ship their own pooling metadata (some BGE variants) get overridden;
+        // models that ship pooling=-1 (Jina-code) get this default. A log
+        // line from llama.cpp confirms what was set.
+        .with_pooling_type(LlamaPoolingType::Mean);
+    model.new_context(backend, params).context("new context")
 }
 
 fn ensure_tokenizer() -> Result<&'static Tokenizer> {
     if let Some(t) = TOKENIZER.get() {
         return Ok(t);
     }
-    // Find tokenizer.json under the current model's snapshot dir. Cache
-    // layout matches what fastembed downloads to ~/.memorize/models.
-    let dir = cache_dir();
-    let repo_dir_name = match current().tag {
-        "all-minilm-l6-v2" => "models--Qdrant--all-MiniLM-L6-v2-onnx",
-        "all-minilm-l6-v2-q" => "models--Xenova--all-MiniLM-L6-v2",
-        "gte-large-en-v1.5" => "models--Alibaba-NLP--gte-large-en-v1.5",
-        "jina-embeddings-v2-base-code" => "models--jinaai--jina-embeddings-v2-base-code",
-        other => bail!("no tokenizer mapping for model {other}"),
-    };
-    let snapshots = dir.join(repo_dir_name).join("snapshots");
-    if !snapshots.exists() {
-        // Force a download by initializing the model — first call populates
-        // the snapshot dir.
-        let _ = ensure_init()?;
-    }
-    let snap = std::fs::read_dir(&snapshots)
-        .with_context(|| format!("read snapshots dir {}", snapshots.display()))?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.join("tokenizer.json").exists())
-        .with_context(|| format!("no tokenizer.json under {}", snapshots.display()))?;
-    let mut tok = Tokenizer::from_file(snap.join("tokenizer.json"))
-        .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
-    // The vendored tokenizer.json sometimes hardcodes truncation (MiniLM ships
-    // max_length=128). Disable so callers see the actual token count — they
-    // do their own splitting based on the model's real max-seq window.
+    let api = hf_api()?;
+    let tok_path = api
+        .model(REPO_TOKENIZER.to_string())
+        .get("tokenizer.json")
+        .with_context(|| format!("download tokenizer.json from {REPO_TOKENIZER}"))?;
+    let mut tok =
+        Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("load tokenizer: {e}"))?;
+    // MiniLM ships tokenizer.json with max_length=128; disable so callers see
+    // true counts and apply their own cap.
     tok.with_truncation(None)
-        .map_err(|e| anyhow::anyhow!("disable truncation: {e}"))?;
+        .map_err(|e| anyhow!("disable truncation: {e}"))?;
     let _ = TOKENIZER.set(tok);
     Ok(TOKENIZER.get().expect("just set"))
 }
 
-/// Token count for a single string, using the current model's tokenizer.
+pub fn model_tag() -> String {
+    // Derive from the GGUF filename so logs/reports identify whichever model
+    // is actually loaded (handy when MEMORIZE_EMBED_GGUF_FILE is set).
+    let f = file_gguf();
+    f.strip_suffix(".gguf").unwrap_or(&f).to_lowercase()
+}
+
+pub fn embedding_dim() -> usize {
+    // Read from the loaded model so downstream code stays correct when the
+    // GGUF source is overridden (e.g. BGE-M3 at 1024-d vs MiniLM at 384-d).
+    ensure_model().map(|m| m.n_embd() as usize).unwrap_or(384)
+}
+
+pub fn max_seq_tokens() -> usize {
+    ensure_model().map(|m| m.n_ctx_train() as usize).unwrap_or(512)
+}
+
 pub fn count_tokens(text: &str) -> Result<usize> {
     let tok = ensure_tokenizer()?;
-    let enc = tok
-        .encode(text, false)
-        .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+    let enc = tok.encode(text, false).map_err(|e| anyhow!("tokenize: {e}"))?;
     Ok(enc.get_ids().len())
 }
 
-/// Split a string into pieces whose token count is <= `cap`. Splits at line
-/// boundaries when possible — single lines longer than `cap` tokens get
-/// further split at byte boundaries proportional to their share of tokens
-/// (rare in source code; only triggered by minified single-line files).
-///
-/// Returns the original string unchanged when it already fits.
+pub fn embed(text: &str) -> Result<Vec<f32>> {
+    let mut v = embed_batch(&[text])?;
+    Ok(v.pop().expect("embed_batch returned empty for 1 input"))
+}
+
+pub fn embed_batch(texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+    if texts.is_empty() {
+        return Ok(vec![]);
+    }
+    let model = ensure_model()?;
+    let seq_cap = model.n_ctx_train() as usize;
+    let n_batch = n_batch_cap() as usize;
+
+    // Tokenize each input. AddBos::Always inserts whatever leading special
+    // token the model expects ([CLS] for BERT-family, <|begin_of_text|> /
+    // similar for decoder-style embedders).
+    let mut tokenized: Vec<Vec<llama_cpp_2::token::LlamaToken>> = Vec::with_capacity(texts.len());
+    for t in texts {
+        let mut toks = model
+            .str_to_token(t, AddBos::Always)
+            .with_context(|| format!("tokenize ({} chars)", t.len()))?;
+        // Defensive cap against the model's positional-embedding window in
+        // case the caller skipped split_to_token_cap().
+        if toks.len() > seq_cap {
+            toks.truncate(seq_cap);
+        }
+        tokenized.push(toks);
+    }
+
+    // Partition into sub-batches that each fit n_batch tokens AND N_SEQ_MAX
+    // sequences. The encoder asserts n_ubatch >= n_tokens, so we have to
+    // split here rather than relying on llama.cpp to schedule across ubatches.
+    let mut sub_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut start = 0usize;
+    let mut cur_tokens = 0usize;
+    for i in 0..tokenized.len() {
+        let this_tokens = tokenized[i].len();
+        let in_progress = i - start;
+        // Flush when adding this sequence would overflow EITHER the token
+        // budget or the seq-max budget. Always include at least one sequence
+        // per sub-batch — a single chunk over n_batch was already truncated
+        // to seq_cap above.
+        if in_progress > 0
+            && (cur_tokens + this_tokens > n_batch || in_progress + 1 > N_SEQ_MAX as usize)
+        {
+            sub_ranges.push(start..i);
+            start = i;
+            cur_tokens = 0;
+        }
+        cur_tokens += this_tokens;
+    }
+    sub_ranges.push(start..tokenized.len());
+
+    let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+    CTX.with(|cell| -> Result<()> {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(build_context()?);
+        }
+
+        for range in &sub_ranges {
+            let chunk_tokens: usize = tokenized[range.clone()].iter().map(|v| v.len()).sum();
+            let mut batch = LlamaBatch::new(chunk_tokens.max(1), range.len() as i32);
+            for (local_idx, toks) in tokenized[range.clone()].iter().enumerate() {
+                let seq_id: i32 = local_idx.try_into().context("seq_id out of range")?;
+                batch.add_sequence(toks, seq_id, false).context("add_sequence")?;
+            }
+
+            // Try once; on error, drop the context (llama.cpp reports "in
+            // error state from a previous command buffer failure - recreate
+            // the backend to recover" after a GPU command buffer failure —
+            // typically OOM. Without dropping, every subsequent call would
+            // inherit the poisoned state.) and retry once. If it still fails,
+            // propagate.
+            let first_try =
+                embed_into(slot.as_mut().expect("just set"), &mut batch, &mut out, range.len());
+            if let Err(e1) = first_try {
+                eprintln!(
+                    "memorize-embed: context error on sub-batch ({range:?}, {chunk_tokens} tokens): {e1}; rebuilding and retrying"
+                );
+                *slot = None;
+                *slot = Some(build_context().context("rebuild context after error")?);
+                let ctx = slot.as_mut().expect("just set");
+                embed_into(ctx, &mut batch, &mut out, range.len())
+                    .with_context(|| format!("retry after error: {e1}"))?;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+fn embed_into(
+    ctx: &mut LlamaContext<'static>,
+    batch: &mut LlamaBatch,
+    out: &mut Vec<Vec<f32>>,
+    n_seqs: usize,
+) -> Result<()> {
+    ctx.clear_kv_cache();
+    // decode() works for both encoder-only (BERT/MiniLM/BGE — llama.cpp
+    // internally redirects to encode() with a log line) and decoder-style
+    // embedding models (Jina-code based on Qwen2, e5-mistral, etc.).
+    // Calling encode() on a decoder model segfaults.
+    ctx.decode(batch).context("decode")?;
+
+    let n_seq_i32: i32 = n_seqs.try_into().context("n_seqs out of range")?;
+    for i in 0..n_seq_i32 {
+        let emb = ctx
+            .embeddings_seq_ith(i)
+            .with_context(|| format!("embeddings_seq_ith({i})"))?;
+        let mut v = emb.to_vec();
+        l2_normalize_in_place(&mut v);
+        out.push(v);
+    }
+    Ok(())
+}
+
+fn l2_normalize_in_place(v: &mut [f32]) {
+    let mag2: f32 = v.iter().map(|x| x * x).sum();
+    let mag = mag2.sqrt().max(1e-12);
+    for x in v.iter_mut() {
+        *x /= mag;
+    }
+}
+
+/// Split a string into pieces with at most `cap` tokens each. Splits at line
+/// boundaries when possible; single lines exceeding `cap` fall back to
+/// byte-proportional splitting (rare in source code; only minified files).
 pub fn split_to_token_cap(text: &str, cap: usize) -> Result<Vec<String>> {
     if cap == 0 {
         bail!("cap must be > 0");
@@ -281,10 +327,7 @@ pub fn split_to_token_cap(text: &str, cap: usize) -> Result<Vec<String>> {
     }
     let mut pieces: Vec<String> = Vec::new();
     let mut buf = String::new();
-    let mut buf_tokens = 0usize;
     for line in text.split('\n') {
-        // Lazily push the joining newline so the count matches what the
-        // model would see if we joined pieces back together.
         let candidate = if buf.is_empty() {
             line.to_string()
         } else {
@@ -293,17 +336,11 @@ pub fn split_to_token_cap(text: &str, cap: usize) -> Result<Vec<String>> {
         let n = count_tokens(&candidate)?;
         if n <= cap {
             buf = candidate;
-            buf_tokens = n;
             continue;
         }
-        // Adding this line overflows. If `buf` is non-empty, flush it and
-        // start a new buffer with `line`.
         if !buf.is_empty() {
             pieces.push(std::mem::take(&mut buf));
-            buf_tokens = 0;
         }
-        // The line on its own might still exceed `cap` (single huge minified
-        // line). Byte-split proportionally as a last resort.
         let line_tokens = count_tokens(line)?;
         if line_tokens > cap {
             for piece in byte_split_to_token_cap(line, cap)? {
@@ -311,35 +348,29 @@ pub fn split_to_token_cap(text: &str, cap: usize) -> Result<Vec<String>> {
             }
         } else {
             buf = line.to_string();
-            buf_tokens = line_tokens;
         }
     }
     if !buf.is_empty() {
         pieces.push(buf);
     }
-    let _ = buf_tokens; // last value isn't read past loop exit
     Ok(pieces)
 }
 
-/// Byte-level fallback: split `line` into roughly equal pieces such that each
-/// is under `cap` tokens. Used only when a single line is too long.
 fn byte_split_to_token_cap(line: &str, cap: usize) -> Result<Vec<String>> {
-    let total_tokens = count_tokens(line)?;
-    if total_tokens <= cap {
+    let total = count_tokens(line)?;
+    if total <= cap {
         return Ok(vec![line.to_string()]);
     }
-    let pieces_needed = total_tokens.div_ceil(cap);
+    let pieces_needed = total.div_ceil(cap);
     let bytes = line.as_bytes();
-    let target_bytes_per_piece = bytes.len() / pieces_needed;
+    let target = bytes.len() / pieces_needed;
     let mut out: Vec<String> = Vec::with_capacity(pieces_needed);
     let mut cur = 0usize;
     while cur < bytes.len() {
-        let mut end = (cur + target_bytes_per_piece).min(bytes.len());
-        // Don't split mid-codepoint.
+        let mut end = (cur + target).min(bytes.len());
         while end < bytes.len() && (bytes[end] & 0xC0) == 0x80 {
             end += 1;
         }
-        // Verify under cap; if not, halve.
         loop {
             let slice = &line[cur..end];
             let n = count_tokens(slice)?;
@@ -361,18 +392,52 @@ fn byte_split_to_token_cap(line: &str, cap: usize) -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn default_choice_is_minilm() {
-        if std::env::var("MEMORIZE_EMBED_MODEL").is_err() {
-            assert_eq!(MINILM.tag, "all-minilm-l6-v2");
-            assert_eq!(MINILM.dim, 384);
-        }
-    }
+    // All tests below load the model + GGUF, so they're gated on the network
+    // (HF download on first run) and on a working Metal device. Run manually
+    // with `cargo test -p memorize-embed --release -- --ignored`.
 
     #[test]
     #[ignore]
     fn embed_returns_expected_dim() {
         let v = embed("hello world").unwrap();
         assert_eq!(v.len(), embedding_dim());
+        assert_eq!(embedding_dim(), 384, "default model should be MiniLM-L6 (384-d)");
+    }
+
+    #[test]
+    #[ignore]
+    fn embed_is_l2_normalized() {
+        let v = embed("hello world").unwrap();
+        let mag: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((mag - 1.0).abs() < 1e-3, "L2 norm should be ~1.0, got {mag}");
+    }
+
+    #[test]
+    #[ignore]
+    fn embed_batch_matches_individual() {
+        // Batched and unbatched embeddings should be byte-identical (modulo
+        // float order). This guards against accidental cross-talk between
+        // sequences in the batched path.
+        let texts = ["alpha", "beta sequence", "gamma ray"];
+        let batched = embed_batch(&texts).unwrap();
+        for (i, t) in texts.iter().enumerate() {
+            let single = embed(t).unwrap();
+            let cos: f32 = batched[i].iter().zip(&single).map(|(a, b)| a * b).sum();
+            assert!(
+                cos > 0.99,
+                "batched vs single cosine for {t:?} = {cos}, expected ~1.0"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn split_to_token_cap_respects_cap() {
+        // Build a string well over the cap, verify every piece is under.
+        let line = "fn foo() { let x = 1; }\n".repeat(200);
+        let pieces = split_to_token_cap(&line, 64).unwrap();
+        for p in &pieces {
+            assert!(count_tokens(p).unwrap() <= 64);
+        }
     }
 }

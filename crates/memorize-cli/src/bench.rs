@@ -388,37 +388,21 @@ pub struct TokensOpts {
     pub root: PathBuf,
     pub limit: Option<usize>,
     pub max_tokens: usize,
-    pub tokenizer: Option<PathBuf>,
     pub out: Option<PathBuf>,
 }
 
-/// Walk a root, run the chunker, tokenize every chunk against the model's
-/// tokenizer, and report the token-count distribution + overflow rate. This
-/// is what tells you whether `TARGET_CHARS` is set correctly for the embedder
-/// you're using.
+/// Walk a root, run the chunker, tokenize every chunk against the embedder's
+/// own tokenizer, and report the token-count distribution + overflow rate.
+/// This is what tells you whether `TARGET_CHARS` is set correctly for the
+/// embedder you're using.
 pub fn tokens(opts: TokensOpts) -> Result<()> {
-    use tokenizers::Tokenizer;
-
     if !opts.root.exists() {
         bail!("root does not exist: {}", opts.root.display());
     }
 
-    let tokenizer_path = match opts.tokenizer.clone() {
-        Some(p) => p,
-        None => default_minilm_tokenizer()
-            .context("no --tokenizer given and MiniLM tokenizer not found in ~/.memorize/models")?,
-    };
     eprintln!("=== memorize bench tokens: {} ===", opts.root.display());
-    eprintln!("tokenizer: {}", tokenizer_path.display());
+    eprintln!("model: {}", memorize_embed::model_tag());
     eprintln!("max-tokens cap: {}", opts.max_tokens);
-
-    let mut tok = Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("load tokenizer {}: {e}", tokenizer_path.display()))?;
-    // The vendored tokenizer.json hardcodes truncation (MiniLM ships max_length=128
-    // even though the model supports 512). Disable so we see the true cost of each
-    // chunk and can decide where to set TARGET_CHARS.
-    tok.with_truncation(None)
-        .map_err(|e| anyhow::anyhow!("disable truncation: {e}"))?;
 
     let max_file_bytes: u64 = 1_048_576;
     let walker = ignore::WalkBuilder::new(&opts.root)
@@ -478,11 +462,10 @@ pub fn tokens(opts: TokensOpts) -> Result<()> {
         files_processed += 1;
 
         for c in &chunks {
-            let encoding = match tok.encode(c.body.as_str(), false) {
-                Ok(e) => e,
+            let n = match memorize_embed::count_tokens(&c.body) {
+                Ok(n) => n,
                 Err(_) => continue,
             };
-            let n = encoding.get_ids().len();
             token_counts.push(n);
             total_chunks += 1;
             if n > opts.max_tokens {
@@ -510,7 +493,7 @@ pub fn tokens(opts: TokensOpts) -> Result<()> {
     let _ = writeln!(s, "# memorize bench — chunk token distribution");
     let _ = writeln!(s);
     let _ = writeln!(s, "**root:** `{}`", opts.root.display());
-    let _ = writeln!(s, "**tokenizer:** `{}`", tokenizer_path.display());
+    let _ = writeln!(s, "**model:** {}", memorize_embed::model_tag());
     let _ = writeln!(s, "**files processed:** {files_processed}");
     let _ = writeln!(s, "**chunks tokenized:** {total_chunks}");
     let _ = writeln!(s, "**elapsed:** {:.2}s", elapsed.as_secs_f64());
@@ -579,22 +562,6 @@ pub fn tokens(opts: TokensOpts) -> Result<()> {
         eprintln!("report written to {}", out.display());
     }
     Ok(())
-}
-
-fn default_minilm_tokenizer() -> Result<PathBuf> {
-    // fastembed caches under ~/.memorize/models per memorize-embed's setup.
-    let home = std::env::var("HOME").context("HOME unset")?;
-    let base = PathBuf::from(home).join(".memorize/models/models--Qdrant--all-MiniLM-L6-v2-onnx/snapshots");
-    if !base.exists() {
-        bail!("MiniLM cache dir not found at {} — run any embed first to download it", base.display());
-    }
-    let snapshot = fs::read_dir(&base)
-        .context("read MiniLM snapshots dir")?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.join("tokenizer.json").exists())
-        .with_context(|| format!("no snapshot with tokenizer.json under {}", base.display()))?;
-    Ok(snapshot.join("tokenizer.json"))
 }
 
 #[derive(Debug)]

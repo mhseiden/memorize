@@ -83,6 +83,7 @@ enum BenchOp {
     },
     /// Tokenize every chunk produced by walking a root, report token-count
     /// distribution + overflow rate vs the model's max-seq cap (512 for MiniLM).
+    /// Uses the embedder's own tokenizer.
     Tokens {
         /// Repo root to scan.
         #[arg(long)]
@@ -93,9 +94,6 @@ enum BenchOp {
         /// Token cap to overflow against. MiniLM = 512.
         #[arg(long, default_value_t = 512)]
         max_tokens: usize,
-        /// Path to a Hugging Face tokenizer.json. Defaults to MiniLM's cached file.
-        #[arg(long)]
-        tokenizer: Option<std::path::PathBuf>,
         /// Write the markdown report to this path.
         #[arg(long)]
         out: Option<std::path::PathBuf>,
@@ -152,8 +150,8 @@ fn main() -> Result<()> {
                 out,
                 separate_embed_init: true,
             }),
-            BenchOp::Tokens { root, limit, max_tokens, tokenizer, out } => {
-                bench::tokens(bench::TokensOpts { root, limit, max_tokens, tokenizer, out })
+            BenchOp::Tokens { root, limit, max_tokens, out } => {
+                bench::tokens(bench::TokensOpts { root, limit, max_tokens, out })
             }
             BenchOp::Embed { sizes, chunks, chunk_chars, out } => {
                 let parsed: Result<Vec<usize>, _> = sizes
