@@ -47,13 +47,10 @@ CREATE TABLE IF NOT EXISTS vec_chunks (
 );
 ALTER TABLE vec_chunks ADD COLUMN IF NOT EXISTS emb_q8 TINYINT[{dim}];
 
--- Retained for backward-compat with existing DBs from Phase 1–3. New
--- inserts go into vec_chunks; legacy single-vector rows in `vec` are
--- ignored by recall after the migration. Drop at user discretion.
-CREATE TABLE IF NOT EXISTS vec (
-    id  BIGINT PRIMARY KEY,
-    emb FLOAT[{dim}]
-);
+-- Drop the Phase 1–3 single-vector-per-obs holdover. Recall has used
+-- `vec_chunks` (multi-vector + max-pool) for years; the row count on
+-- live DBs is 0. Idempotent: `IF EXISTS` is a no-op on fresh installs.
+DROP TABLE IF EXISTS vec;
 
 -- Bidirectional synonym pairs. (k8s, kubernetes) and (kubernetes, k8s) both
 -- live as rows. Query-time expansion is a SQL join — no in-memory cache.

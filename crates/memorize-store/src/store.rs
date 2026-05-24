@@ -663,12 +663,10 @@ impl Store {
     }
 
     /// Drop observations older than `cutoff_ts`. Returns rows removed.
-    /// Orphaned vector rows (both legacy `vec` and `vec_chunks`) are cleaned
-    /// in the same pass.
+    /// Orphaned `vec_chunks` rows are cleaned in the same pass.
     pub fn evict_older_than(&self, cutoff_ts: i64) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let deleted = conn.execute("DELETE FROM obs WHERE ts < ?", params![cutoff_ts])?;
-        conn.execute("DELETE FROM vec WHERE id NOT IN (SELECT id FROM obs)", [])?;
         conn.execute(
             "DELETE FROM vec_chunks WHERE obs_id NOT IN (SELECT id FROM obs)",
             [],
