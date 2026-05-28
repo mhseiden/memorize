@@ -21,7 +21,7 @@
 
 use crate::Mode;
 use anyhow::Result;
-use memorize_store::Store;
+use memorize_store::{FileMeta, Store};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
@@ -62,6 +62,10 @@ impl Default for CodeRecallConfig {
 }
 
 /// One returned chunk + its fused score.
+///
+/// `stale=true` means the on-disk file has changed (mtime or size) since the
+/// chunk was indexed. The body field still carries what we last indexed —
+/// callers decide whether to use it, re-read the file, or skip the result.
 #[derive(Debug, Serialize)]
 pub struct CodeRecalled {
     pub id: i64,
@@ -73,6 +77,7 @@ pub struct CodeRecalled {
     pub qualified: String,
     pub body: String,
     pub score: f64,
+    pub stale: bool,
 }
 
 /// End-to-end code recall.
@@ -189,21 +194,66 @@ fn hydrate(store: &Store, picked: &[(i64, f64)]) -> Result<Vec<CodeRecalled>> {
     let ids: Vec<i64> = picked.iter().map(|(id, _)| *id).collect();
     let rows = store.get_code_chunks_by_ids(&ids)?;
     let scores: Vec<f64> = picked.iter().map(|(_, s)| *s).collect();
+
+    // Batch FileMeta lookups: one query per unique path. With max_per_file=2
+    // and limit=10, ≤10 lookups per recall.
+    let unique_paths: HashSet<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+    let mut metas: HashMap<String, FileMeta> = HashMap::with_capacity(unique_paths.len());
+    for path in unique_paths {
+        if let Ok(Some(m)) = store.get_file_meta(path) {
+            metas.insert(path.to_string(), m);
+        }
+    }
+
     Ok(rows
         .into_iter()
         .zip(scores)
-        .map(|(r, score)| CodeRecalled {
-            id: r.id,
-            path: r.path,
-            language: r.language,
-            line_start: r.line_start,
-            line_end: r.line_end,
-            kind: r.kind,
-            qualified: r.qualified,
-            body: r.body,
-            score,
+        .map(|(r, score)| {
+            let stale = is_stale(&r.path, metas.get(&r.path));
+            CodeRecalled {
+                id: r.id,
+                path: r.path,
+                language: r.language,
+                line_start: r.line_start,
+                line_end: r.line_end,
+                kind: r.kind,
+                qualified: r.qualified,
+                body: r.body,
+                score,
+                stale,
+            }
         })
         .collect())
+}
+
+/// True if the file on disk no longer matches what we indexed. Catches the
+/// common case (file edited and saved → mtime bumps). Misses mtime-preserving
+/// rewrites like `touch -r`, but those are rare in normal dev workflows. No
+/// hash check — see commit notes for the design choice.
+fn is_stale(path: &str, indexed: Option<&FileMeta>) -> bool {
+    let indexed = match indexed {
+        // No `files` row but we have a chunk: the file was unindexed or the
+        // tables drifted. Treat as stale rather than trust the body.
+        None => return true,
+        Some(m) => m,
+    };
+    match stat_for_compare(path) {
+        Some((mt, sz)) => mt != indexed.mtime_ns || sz != indexed.size_bytes,
+        None => true,
+    }
+}
+
+/// `(mtime_ns, size_bytes)` of `path`, or `None` if the file is missing or
+/// its mtime can't be expressed as a unix timestamp.
+fn stat_for_compare(path: &str) -> Option<(i64, i64)> {
+    let m = std::fs::metadata(path).ok()?;
+    let mtime_ns = m
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as i64;
+    Some((mtime_ns, m.len() as i64))
 }
 
 /// Lowercase + split the query on whitespace and `/_-.` so each token
@@ -267,6 +317,72 @@ mod tests {
         let picked = diversify(&fused, 4, Some(2));
         // 2x a.ts allowed, then b.ts, then c.ts.
         assert_eq!(picked.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![1, 2, 4, 5]);
+    }
+
+    /// Throwaway file in `std::env::temp_dir()`. RAII delete on drop so a
+    /// panicking test still cleans up. Avoids pulling in `tempfile` as a
+    /// dep just for these three tests.
+    struct ScratchFile(std::path::PathBuf);
+    impl ScratchFile {
+        fn new(label: &str, contents: &[u8]) -> Self {
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("memorize-stale-{label}-{pid}-{nanos}"));
+            std::fs::write(&path, contents).unwrap();
+            ScratchFile(path)
+        }
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+    impl Drop for ScratchFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn current_meta(path: &str) -> FileMeta {
+        let (mtime_ns, size_bytes) = super::stat_for_compare(path).unwrap();
+        FileMeta {
+            mtime_ns,
+            size_bytes,
+            git_rev: None,
+        }
+    }
+
+    #[test]
+    fn is_stale_returns_false_when_file_unchanged() {
+        let f = ScratchFile::new("unchanged", b"hello world");
+        let meta = current_meta(f.path());
+        assert!(!super::is_stale(f.path(), Some(&meta)));
+    }
+
+    #[test]
+    fn is_stale_returns_true_when_size_differs() {
+        let f = ScratchFile::new("resized", b"hello world");
+        let meta = current_meta(f.path());
+        std::fs::write(&f.0, b"hello world MUCH LONGER NOW").unwrap();
+        assert!(super::is_stale(f.path(), Some(&meta)));
+    }
+
+    #[test]
+    fn is_stale_returns_true_when_file_missing() {
+        let path = "/tmp/memorize-stale-this-path-does-not-exist-9c2b4a";
+        let meta = FileMeta {
+            mtime_ns: 1,
+            size_bytes: 1,
+            git_rev: None,
+        };
+        assert!(super::is_stale(path, Some(&meta)));
+    }
+
+    #[test]
+    fn is_stale_returns_true_when_indexed_meta_missing() {
+        // chunk exists but no `files` row → caller should treat as stale.
+        assert!(super::is_stale("/tmp/anything", None));
     }
 
     #[test]
