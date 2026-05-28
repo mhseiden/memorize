@@ -398,21 +398,15 @@ fn drain_watcher(
     rx: &mpsc::Receiver<notify_debouncer_full::DebounceEventResult>,
     _handle: WatcherHandle,
 ) {
-    let cfg = &state.config.code_index;
-    let rebuild_interval = Duration::from_secs(cfg.fts_rebuild_interval_secs.max(1));
-    let mut last_fts_rebuild = Instant::now();
-
     // Use recv_timeout so we can transition phase to Idle when quiet.
+    // FTS is updated synchronously inside each `upsert_code_file` /
+    // `delete_code_file`, so no periodic rebuild is needed here.
     loop {
         match rx.recv_timeout(Duration::from_secs(30)) {
             Ok(Ok(events)) => {
                 state.indexer_status.set_phase(IndexerPhase::Watching);
                 for ev in events {
                     handle_event(state, roots, log, &ev);
-                }
-                if last_fts_rebuild.elapsed() > rebuild_interval {
-                    let _ = state.store.rebuild_fts();
-                    last_fts_rebuild = Instant::now();
                 }
             }
             Ok(Err(errs)) => {

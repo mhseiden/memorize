@@ -8,6 +8,7 @@
 //! return the scalar score, which sidesteps the awkward Arrow-backed
 //! array-read path in `duckdb-rs`.
 
+pub mod fts;
 pub mod schema;
 pub mod store;
 pub mod synonyms_seed;

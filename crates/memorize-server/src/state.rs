@@ -53,12 +53,10 @@ impl ServerState {
         // ~3ms queries (vs ~80ms via DuckDB SQL int8 dot product).
         store.enable_vec_cache()?;
         let store = Arc::new(store);
-        // Background FTS rebuild loop. Polls every 5s; rebuilds take ~4s on
-        // 192k chunks but happen on a cloned DuckDB connection so route
-        // handlers don't block on them. DuckDB MVCC keeps the snapshots
-        // coherent — search queries see either the pre- or post-rebuild
-        // FTS state depending on when they snapshotted.
-        Store::spawn_fts_worker(Arc::clone(&store), std::time::Duration::from_secs(5))?;
+        // FTS is in-process (tantivy, `RamDirectory`). Built at `Store::open`
+        // from the persisted `obs.body` / `code_chunks.body` columns and
+        // mutated synchronously on each write. No background worker — the
+        // tantivy `IndexWriter` is its own concurrency boundary.
         let mut config = crate::config::load().unwrap_or_default();
         crate::config::apply_env_overrides(&mut config);
         let initial = IndexerSnapshot::initial(

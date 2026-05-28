@@ -43,6 +43,10 @@ ureq = { version = "2", features = ["json"] }
 # subcommand. Counts MiniLM WordPiece tokens against the same vocab the
 # embedder uses.
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+# In-process BM25 index. We run with the default feature set minus `mmap` —
+# the daemon keeps the FTS index in a `RamDirectory` and rebuilds it on
+# startup from `obs.body` / `code_chunks.body`, so no on-disk segments.
+tantivy = { version = "0.26", default-features = false, features = ["lz4-compression", "stemmer", "stopwords"] }
 
 [profile.release]
 lto = "thin"

@@ -1,16 +1,15 @@
 use crate::DEFAULT_EMBED_DIM;
+use crate::fts::FtsIndex;
 use crate::schema::{
-    backfill_path_tokens_sql, fts_index_sql, migrate_vec_chunks_to_int8_sql,
-    migrate_vec_code_to_int8_sql, schema_sql, vec_chunks_legacy_emb_probe_sql,
-    vec_code_legacy_emb_probe_sql,
+    backfill_path_tokens_sql, migrate_vec_chunks_to_int8_sql, migrate_vec_code_to_int8_sql,
+    schema_sql, vec_chunks_legacy_emb_probe_sql, vec_code_legacy_emb_probe_sql,
 };
 use crate::synonyms_seed::DEFAULT_PAIRS;
 use anyhow::{Context, Result, bail};
 use duckdb::{Connection, params};
 use memorize_core::{Kind, NewObservation, Observation};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock, RwLock};
 
 /// In-memory int8 vector index. Populated lazily by callers via
 /// `Store::enable_vec_cache()`; daemons enable it at startup so vector
@@ -53,11 +52,13 @@ pub struct Store {
     /// embeddings). Same shape as `vec_cache` but the search path
     /// MAX-pools per obs_id since each obs has multiple chunks.
     obs_vec_cache: OnceLock<RwLock<ObsVecCache>>,
-    /// True when an `obs` insert or a `code_chunks` upsert/delete has
-    /// happened since the last `rebuild_fts`. Background worker reads
-    /// this on its poll loop; route handlers don't touch it. Starts
-    /// `true` so the first rebuild after startup fires.
-    fts_dirty: Mutex<bool>,
+    /// In-process BM25 indexes (obs + code). Tantivy-backed, kept in a
+    /// `RamDirectory` and rebuilt at `Store::open` from the persisted
+    /// `obs.body` / `code_chunks.body` columns. The earlier DuckDB FTS path
+    /// crashed when its bg rebuild worker raced the indexer's write
+    /// transaction; tantivy's writer is its own concurrency boundary so
+    /// route handlers and indexer mutate it directly without a worker.
+    fts: FtsIndex,
 }
 
 /// BM25 + vector recall results carry the obs id, session (for diversification),
@@ -130,9 +131,10 @@ impl Store {
             embed_dim: dim,
             vec_cache: OnceLock::new(),
             obs_vec_cache: OnceLock::new(),
-            fts_dirty: Mutex::new(true),
+            fts: FtsIndex::new().context("create fts index")?,
         };
         store.init()?;
+        store.rebuild_fts_from_db()?;
         Ok(store)
     }
 
@@ -153,14 +155,16 @@ impl Store {
         )
         .context("open duckdb read-only")?;
         let write_conn = conn.try_clone().context("clone write conn")?;
-        Ok(Store {
+        let store = Store {
             conn: Mutex::new(conn),
             write_conn: Mutex::new(write_conn),
             embed_dim: dim,
             vec_cache: OnceLock::new(),
             obs_vec_cache: OnceLock::new(),
-            fts_dirty: Mutex::new(true),
-        })
+            fts: FtsIndex::new().context("create fts index")?,
+        };
+        store.rebuild_fts_from_db()?;
+        Ok(store)
     }
 
     /// In-memory store at the default dim — used by store tests.
@@ -180,7 +184,7 @@ impl Store {
             embed_dim: dim,
             vec_cache: OnceLock::new(),
             obs_vec_cache: OnceLock::new(),
-            fts_dirty: Mutex::new(true),
+            fts: FtsIndex::new().context("create fts index")?,
         };
         store.init()?;
         Ok(store)
@@ -231,9 +235,59 @@ impl Store {
 
         conn.execute_batch(backfill_path_tokens_sql())
             .context("backfill path_tokens")?;
-        conn.execute_batch(fts_index_sql()).context("create fts index")?;
         drop(conn);
         self.seed_synonyms_once()?;
+        Ok(())
+    }
+
+    /// Stream every row of `obs` and `code_chunks` into the in-process
+    /// tantivy index. Called once at `Store::open` time. The corpus is small
+    /// (~200k chunks + a few thousand obs), so a cold rebuild costs roughly
+    /// the same as the old DuckDB FTS rebuild — but it happens exactly once
+    /// per daemon start instead of every ~5 s.
+    fn rebuild_fts_from_db(&self) -> Result<()> {
+        let t = std::time::Instant::now();
+        let conn = self.conn.lock().unwrap();
+        let mut n_obs = 0usize;
+        {
+            let mut stmt = conn.prepare("SELECT id, body FROM obs")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let id: i64 = row.get(0)?;
+                let body: String = row.get(1)?;
+                self.fts.insert_obs(id, &body)?;
+                n_obs += 1;
+            }
+        }
+        let mut n_code = 0usize;
+        {
+            // The tantivy `CodeTokenizer` splits camelCase + path separators
+            // itself, so we pass the raw `path` as the `path_tokens` field
+            // input — the SQL-side pre-split column (`code_chunks.path_tokens`)
+            // is no longer load-bearing and is left in place only to avoid a
+            // schema migration in this change.
+            let mut stmt = conn
+                .prepare("SELECT id, path, language, body, qualified FROM code_chunks")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let id: i64 = row.get(0)?;
+                let path: String = row.get(1)?;
+                let language: String = row.get(2)?;
+                let body: String = row.get(3)?;
+                let qualified: String = row.get(4)?;
+                self.fts
+                    .insert_code(id, &path, &language, &body, &qualified, &path)?;
+                n_code += 1;
+            }
+        }
+        drop(conn);
+        self.fts.commit()?;
+        eprintln!(
+            "memorize-store: fts rebuilt in {:.1}s ({} obs, {} code chunks)",
+            t.elapsed().as_secs_f64(),
+            n_obs,
+            n_code
+        );
         Ok(())
     }
 
@@ -331,34 +385,52 @@ impl Store {
                 cache.push(id, q8);
             }
         }
-        self.mark_fts_dirty();
+        // Index in tantivy and commit. Tantivy's writer is its own concurrency
+        // boundary, so we don't need to defer the commit to a background
+        // worker — but the commit *does* invalidate readers until reload,
+        // so other writers shouldn't interleave between add and commit. The
+        // writer mutex inside FtsIndex handles that.
+        self.fts.insert_obs(id, &obs.body)?;
+        self.fts.commit()?;
         Ok(id)
     }
 
-    /// Run BM25 over obs.body. The caller is responsible for synonym expansion;
-    /// `query` here is the expanded form. DuckDB's FTS `match_bm25` accepts the
-    /// query as a string with implicit OR semantics, so an expansion of
-    /// "k8s kubernetes kube" will match a document containing any term.
+    /// Run BM25 over obs.body. The caller is responsible for synonym
+    /// expansion; `query` here is the expanded form. The tokenizer used by
+    /// the obs index (`en_stem`) does the same lowercase + Snowball stemming
+    /// that DuckDB FTS did, so query and document tokens match.
     pub fn search_bm25(&self, query: &str, limit: usize) -> Result<Vec<BM25Hit>> {
+        let hits = self.fts.search_obs(query, limit)?;
+        if hits.is_empty() {
+            return Ok(vec![]);
+        }
+        // Hydrate session from DuckDB. The fusion pipeline downstream
+        // diversifies by session, so we can't skip it.
+        let ids: Vec<i64> = hits.iter().map(|h| h.id).collect();
+        let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id, session FROM obs WHERE id IN ({placeholders})");
         let conn = self.conn.lock().unwrap();
-        let sql = "
-            SELECT obs.id, obs.session, fts_main_obs.match_bm25(obs.id, ?) AS score
-              FROM obs
-             WHERE score IS NOT NULL
-          ORDER BY score DESC
-             LIMIT ?
-        ";
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt
-            .query_map(params![query, limit as i64], |row| {
-                Ok(BM25Hit {
-                    id: row.get(0)?,
-                    session: row.get(1)?,
-                    score: row.get(2)?,
-                })
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn duckdb::ToSql> =
+            ids.iter().map(|id| id as &dyn duckdb::ToSql).collect();
+        let sessions: std::collections::HashMap<i64, String> = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect();
+        Ok(hits
+            .into_iter()
+            .filter_map(|h| {
+                let session = sessions.get(&h.id)?.clone();
+                Some(BM25Hit {
+                    id: h.id,
+                    session,
+                    score: h.score,
+                })
+            })
+            .collect())
     }
 
     /// Cosine over per-chunk embeddings. Each chunk is scored independently;
@@ -575,85 +647,12 @@ impl Store {
         Ok(rows)
     }
 
-    /// Rebuild the FTS index if dirty. Held for backward-compat with the
-    /// few call sites that still ask. The production daemon now uses a
-    /// background worker (see `spawn_fts_worker`) so the request path
-    /// doesn't pay the rebuild cost. The eval harness and tests still
-    /// call this synchronously since they don't have a worker thread.
+    /// Compatibility shim for the eval harness, which historically called
+    /// this between bulk inserts and queries. Tantivy already commits inside
+    /// `insert_obs_chunked` / `upsert_code_file`, so this is now a no-op —
+    /// we keep it so the harness's timing breakdown can still measure
+    /// "rebuild time" (which trivially reports ~0 ms post-migration).
     pub fn rebuild_fts(&self) -> Result<()> {
-        let mut dirty = self.fts_dirty.lock().unwrap();
-        if !*dirty {
-            return Ok(());
-        }
-        let conn = self.conn.lock().unwrap();
-        conn.execute_batch(fts_index_sql())?;
-        *dirty = false;
-        Ok(())
-    }
-
-    /// Mark the FTS index stale. Callers that mutate `obs` or `code_chunks`
-    /// invoke this so the next rebuild actually runs.
-    pub fn mark_fts_dirty(&self) {
-        *self.fts_dirty.lock().unwrap() = true;
-    }
-
-    /// True if FTS has been marked dirty since the last successful rebuild.
-    /// Used by the background worker.
-    pub fn fts_is_dirty(&self) -> bool {
-        *self.fts_dirty.lock().unwrap()
-    }
-
-    /// Mark the FTS index clean. Only the background worker calls this,
-    /// after a successful rebuild on its own connection.
-    pub fn mark_fts_clean(&self) {
-        *self.fts_dirty.lock().unwrap() = false;
-    }
-
-    /// Clone the underlying DuckDB connection. Used to give the background
-    /// FTS worker its own handle so its long-running `PRAGMA create_fts_index`
-    /// doesn't serialize behind the route handlers' BM25 + vector reads.
-    /// DuckDB's MVCC keeps the two connections coherent.
-    pub fn clone_connection(&self) -> Result<Connection> {
-        let conn = self.conn.lock().unwrap();
-        Ok(conn.try_clone()?)
-    }
-
-    /// Spawn a background thread that polls `fts_dirty` and rebuilds the
-    /// FTS index on its own DuckDB connection. The worker uses a separate
-    /// connection from the main `Store.conn` mutex, so its multi-second
-    /// `PRAGMA create_fts_index` runs concurrently with route-handler
-    /// queries — DuckDB's MVCC lets search snapshot the pre-rebuild FTS
-    /// state until the rebuild commits.
-    ///
-    /// The thread runs forever (until the process exits). For the personal
-    /// daemon use case we don't have a shutdown protocol; if you need one,
-    /// add an `Arc<AtomicBool>` shutdown flag.
-    pub fn spawn_fts_worker(store: Arc<Self>, poll_interval: Duration) -> Result<()> {
-        let bg_conn = store.clone_connection()?;
-        std::thread::Builder::new()
-            .name("memorize-fts-worker".into())
-            .spawn(move || {
-                loop {
-                    std::thread::sleep(poll_interval);
-                    if !store.fts_is_dirty() {
-                        continue;
-                    }
-                    let t = std::time::Instant::now();
-                    match bg_conn.execute_batch(crate::schema::fts_index_sql()) {
-                        Ok(_) => {
-                            store.mark_fts_clean();
-                            eprintln!(
-                                "memorize-store: fts rebuilt by worker in {:.1}s",
-                                t.elapsed().as_secs_f64()
-                            );
-                        }
-                        Err(e) => {
-                            eprintln!("memorize-store: fts worker rebuild failed: {e}");
-                            // Leave fts_dirty=true so the next tick retries.
-                        }
-                    }
-                }
-            })?;
         Ok(())
     }
 
@@ -736,7 +735,7 @@ impl Store {
         // we can both apply them to DuckDB AND, on COMMIT, push the same
         // mutation into the in-memory vec cache. Without that the cache
         // would drift from the on-disk truth on every file change.
-        let work: Result<(Vec<i64>, Vec<(i64, Vec<i8>)>)> = (|| {
+        let work: Result<(Vec<i64>, Vec<(i64, Vec<i8>)>, Vec<(i64, String, String)>)> = (|| {
             let stale_ids: Vec<i64> = {
                 let mut stmt =
                     conn.prepare("SELECT id FROM code_chunks WHERE path = ?")?;
@@ -784,6 +783,10 @@ impl Store {
                 .unwrap_or(0);
             let dim = self.embed_dim;
             let mut new_pairs: Vec<(i64, Vec<i8>)> = Vec::with_capacity(chunks.len());
+            // Capture what we need to feed tantivy after COMMIT. We don't
+            // touch the index until the DuckDB tx is durable so the two
+            // can't diverge if commit fails.
+            let mut fts_inserts: Vec<(i64, String, String)> = Vec::with_capacity(chunks.len());
             for (i, c) in chunks.iter().enumerate() {
                 let id = base + 1 + i as i64;
                 conn.execute(
@@ -816,12 +819,13 @@ impl Store {
                 );
                 conn.execute_batch(&insert_vec)?;
                 new_pairs.push((id, q8));
+                fts_inserts.push((id, c.body.clone(), c.qualified.clone()));
             }
-            Ok((stale_ids, new_pairs))
+            Ok((stale_ids, new_pairs, fts_inserts))
         })();
 
         match work {
-            Ok((stale_ids, new_pairs)) => {
+            Ok((stale_ids, new_pairs, fts_inserts)) => {
                 conn.execute_batch("COMMIT")?;
                 drop(conn);
                 // Apply the same mutations to the in-memory cache, if enabled.
@@ -834,7 +838,17 @@ impl Store {
                         cache.insert(id, q8);
                     }
                 }
-                self.mark_fts_dirty();
+                // Sync tantivy: drop stale chunk ids, add new ones, commit
+                // once at the end so we don't reload the searcher between
+                // every chunk.
+                for id in &stale_ids {
+                    self.fts.delete_code(*id)?;
+                }
+                for (id, body, qualified) in fts_inserts {
+                    self.fts
+                        .insert_code(id, path, language, &body, &qualified, path)?;
+                }
+                self.fts.commit()?;
                 Ok(())
             }
             Err(e) => {
@@ -901,7 +915,8 @@ impl Store {
             cache.obs_ids.clear();
             cache.vecs.clear();
         }
-        self.mark_fts_dirty();
+        self.fts.clear_code()?;
+        self.fts.commit()?;
         Ok(())
     }
 
@@ -934,7 +949,10 @@ impl Store {
             }
         }
         if !stale_ids.is_empty() {
-            self.mark_fts_dirty();
+            for id in &stale_ids {
+                self.fts.delete_code(*id)?;
+            }
+            self.fts.commit()?;
         }
         Ok(())
     }
@@ -1002,7 +1020,10 @@ impl Store {
         Ok(conn.query_row("SELECT COUNT(*) FROM code_chunks", [], |r| r.get(0))?)
     }
 
-    /// BM25 over code_chunks.body. Optional language and path-prefix filters.
+    /// BM25 over `code_chunks.body` + `qualified` + path tokens. The tantivy
+    /// `CodeTokenizer` does the camelCase + path-separator split on both the
+    /// indexed text and the query string, so `irMemo/memo.ts` matches a doc
+    /// at `packages/.../irMemo/memo.ts` without any caller-side preprocessing.
     pub fn search_code_bm25(
         &self,
         query: &str,
@@ -1010,54 +1031,15 @@ impl Store {
         language: Option<&str>,
         path_prefix: Option<&str>,
     ) -> Result<Vec<CodeBM25Hit>> {
-        let conn = self.conn.lock().unwrap();
-        // The transforms inside `match_bm25` mirror the same regex pair used
-        // for `path_tokens` at index time (see `backfill_path_tokens_sql`):
-        // first split camelCase boundaries (`snapshotMemoGraph` →
-        // `snapshot Memo Graph`), then split path-style separators
-        // (`packages/.../irMemo/memo.ts` → `packages ... irMemo memo ts`).
-        // Without this, a query like `irMemo/memo.ts` would tokenize as a
-        // single FTS token and miss everything we indexed. Co-located with
-        // the search SQL so changing one rule keeps both sides in lockstep —
-        // no Rust-side mirror to drift.
-        let mut sql = String::from(
-            "SELECT cc.id, cc.path,
-                    fts_main_code_chunks.match_bm25(
-                        cc.id,
-                        regexp_replace(
-                            regexp_replace(?, '([a-z])([A-Z])', '\\1 \\2', 'g'),
-                            '[/_.\\-]',
-                            ' ',
-                            'g'
-                        )
-                    ) AS score
-               FROM code_chunks cc
-              WHERE score IS NOT NULL",
-        );
-        let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = vec![Box::new(query.to_string())];
-        if let Some(lang) = language {
-            sql.push_str(" AND cc.language = ?");
-            params_vec.push(Box::new(lang.to_string()));
-        }
-        if let Some(prefix) = path_prefix {
-            sql.push_str(" AND cc.path LIKE ?");
-            params_vec.push(Box::new(format!("{prefix}%")));
-        }
-        sql.push_str(" ORDER BY score DESC LIMIT ?");
-        params_vec.push(Box::new(limit as i64));
-        let param_refs: Vec<&dyn duckdb::ToSql> =
-            params_vec.iter().map(|b| b.as_ref()).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                Ok(CodeBM25Hit {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    score: row.get(2)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        let hits = self.fts.search_code(query, limit, language, path_prefix)?;
+        Ok(hits
+            .into_iter()
+            .map(|h| CodeBM25Hit {
+                id: h.id,
+                path: h.path,
+                score: h.score,
+            })
+            .collect())
     }
 
     /// Vector search over `vec_code.emb_q8`. If the in-memory cache is

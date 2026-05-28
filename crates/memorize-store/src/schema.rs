@@ -124,20 +124,6 @@ ALTER TABLE vec_code ADD COLUMN IF NOT EXISTS emb_q8 TINYINT[{dim}];
     )
 }
 
-/// FTS indexes — rebuilt periodically since DuckDB's FTS has no
-/// incremental update. Cheap at our scale.
-///
-/// DuckDB FTS allows multiple columns per index but only one index per
-/// table. We index body + qualified + path_tokens in a single combined
-/// index so `match_bm25` scores across all three fields at once. Earlier
-/// the table had two back-to-back `create_fts_index` calls with
-/// `overwrite=1`; the second silently replaced the first, leaving only
-/// `qualified` indexed and `body` BM25 effectively dead.
-pub fn fts_index_sql() -> &'static str {
-    "PRAGMA create_fts_index('obs', 'id', 'body', overwrite=1);
-     PRAGMA create_fts_index('code_chunks', 'id', 'body', 'qualified', 'path_tokens', overwrite=1);"
-}
-
 /// One-shot migration from FLOAT[N] to TINYINT[N] for the code-vector table.
 /// Only fires when the legacy `emb` column is still present.
 ///

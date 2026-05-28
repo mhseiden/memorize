@@ -33,10 +33,6 @@ pub struct CodeIndexConfig {
     pub respect_gitignore: bool,
     /// Debounce for the file watcher. 250ms covers typical IDE save bursts.
     pub debounce_ms: u64,
-    /// Rebuild FTS at most this often during watcher event loops. Keeps the
-    /// indexer responsive on rapid save bursts while still flushing newly
-    /// inserted chunks to BM25 promptly.
-    pub fts_rebuild_interval_secs: u64,
     /// Master switch — false disables the whole indexer thread.
     pub enabled: bool,
 }
@@ -50,7 +46,6 @@ impl Default for CodeIndexConfig {
             max_file_bytes: 1_048_576,
             respect_gitignore: true,
             debounce_ms: 250,
-            fts_rebuild_interval_secs: 5,
             enabled: true,
         }
     }
@@ -174,9 +169,6 @@ respect_gitignore = true
 
 # Debounce window for the file watcher (ms).
 debounce_ms = 250
-
-# Maximum interval between FTS rebuilds during a watcher event burst (seconds).
-fts_rebuild_interval_secs = 5
 
 # Master switch. false disables the indexer thread entirely.
 # Env override: MEMORIZE_CODE_INDEX=0
