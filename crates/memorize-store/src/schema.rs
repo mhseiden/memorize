@@ -96,17 +96,8 @@ CREATE TABLE IF NOT EXISTS code_chunks (
     line_start  INTEGER NOT NULL,
     line_end    INTEGER NOT NULL,
     kind        VARCHAR NOT NULL,
-    qualified   VARCHAR NOT NULL,
-    -- FTS-friendly tokenization of (path + qualified). Path separators
-    -- (`/_-.`) flatten to spaces, and camelCase identifiers in `qualified`
-    -- split on case boundaries (`snapshotMemoGraph` → `snapshot Memo Graph`).
-    -- Without this, query "memo" doesn't match qualified=`snapshotMemoGraph`
-    -- because DuckDB's FTS tokenizer keeps camelCase as a single token.
-    -- Populated at upsert and force-recomputed on every store init so the
-    -- tokenization stays in sync with whatever rule we used last.
-    path_tokens VARCHAR
+    qualified   VARCHAR NOT NULL
 );
-ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS path_tokens VARCHAR;
 
 -- Int8 scalar quantization. Each f32 component of the L2-normalized
 -- embedder output (range [-1, 1]) maps to `round(v * 127)` as TINYINT.
@@ -207,16 +198,19 @@ pub fn drop_code_chunk_body_sql() -> &'static str {
      CHECKPOINT;"
 }
 
-/// Force-recompute `path_tokens` on store init. Cheap at our scale (~84k
-/// rows on slate, single UPDATE) and guarantees the column matches whatever
-/// tokenization rule the codebase last shipped — no stale tokens when we
-/// change the rule. Computes path-separator splits + camelCase splits of
-/// `qualified` into a single space-separated lowercased token stream.
-pub fn backfill_path_tokens_sql() -> &'static str {
-    "UPDATE code_chunks
-        SET path_tokens = lower(
-            regexp_replace(path, '[/_.\\-]', ' ', 'g')
-            || ' '
-            || regexp_replace(qualified, '([a-z])([A-Z])', '\\1 \\2', 'g')
-        )"
+/// True iff `code_chunks` still has the dead `path_tokens` column. Gates the
+/// one-time drop so the ALTER + CHECKPOINT only runs on pre-existing DBs.
+pub fn code_chunks_has_path_tokens_probe_sql() -> &'static str {
+    "SELECT count(*) > 0
+       FROM duckdb_columns
+      WHERE table_name = 'code_chunks' AND column_name = 'path_tokens'"
+}
+
+/// Drop the dead `path_tokens` column. It was a SQL-side camelCase/path
+/// pre-split for the old DuckDB FTS; the in-RAM tantivy `CodeTokenizer` now
+/// does that splitting itself from the raw `path`, so nothing reads the column.
+/// One-time: gated by `code_chunks_has_path_tokens_probe_sql`.
+pub fn drop_code_chunk_path_tokens_sql() -> &'static str {
+    "ALTER TABLE code_chunks DROP COLUMN IF EXISTS path_tokens;
+     CHECKPOINT;"
 }

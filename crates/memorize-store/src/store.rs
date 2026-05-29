@@ -1,9 +1,10 @@
 use crate::DEFAULT_EMBED_DIM;
 use crate::fts::FtsIndex;
 use crate::schema::{
-    backfill_path_tokens_sql, code_chunks_has_body_probe_sql, drop_code_chunk_body_sql,
-    migrate_vec_chunks_to_int8_sql, migrate_vec_code_to_int8_sql, schema_sql,
-    vec_chunks_legacy_emb_probe_sql, vec_code_legacy_emb_probe_sql,
+    code_chunks_has_body_probe_sql, code_chunks_has_path_tokens_probe_sql,
+    drop_code_chunk_body_sql, drop_code_chunk_path_tokens_sql, migrate_vec_chunks_to_int8_sql,
+    migrate_vec_code_to_int8_sql, schema_sql, vec_chunks_legacy_emb_probe_sql,
+    vec_code_legacy_emb_probe_sql,
 };
 use crate::synonyms_seed::DEFAULT_PAIRS;
 use anyhow::{Context, Result, bail};
@@ -250,13 +251,12 @@ impl Store {
             );
         }
 
-        conn.execute_batch(backfill_path_tokens_sql())
-            .context("backfill path_tokens")?;
-
-        // One-time: drop the now-dead chunk `body`/`body_hash` columns. Bodies
-        // are reconstructed from file line ranges (see `slice_lines`) at
-        // recall/FTS-rebuild time; `body_hash` was already write-only. Gated so
-        // it only fires on DBs that still have the columns.
+        // One-time: drop now-dead `code_chunks` columns. Bodies are
+        // reconstructed from file line ranges (see `slice_lines`); `body_hash`
+        // was write-only; `path_tokens` was a SQL-side pre-tokenization that
+        // the in-RAM tantivy `CodeTokenizer` now does itself, so nothing reads
+        // it. Each drop is gated so it only fires on DBs that still have the
+        // column.
         let has_body: bool = conn
             .query_row(code_chunks_has_body_probe_sql(), [], |r| r.get(0))
             .unwrap_or(false);
@@ -264,6 +264,14 @@ impl Store {
             eprintln!("memorize-store: dropping code_chunks.body/body_hash (one-time)...");
             conn.execute_batch(drop_code_chunk_body_sql())
                 .context("drop code_chunks body columns")?;
+        }
+        let has_path_tokens: bool = conn
+            .query_row(code_chunks_has_path_tokens_probe_sql(), [], |r| r.get(0))
+            .unwrap_or(false);
+        if has_path_tokens {
+            eprintln!("memorize-store: dropping code_chunks.path_tokens (one-time)...");
+            conn.execute_batch(drop_code_chunk_path_tokens_sql())
+                .context("drop code_chunks path_tokens column")?;
         }
         drop(conn);
         self.seed_synonyms_once()?;
@@ -293,9 +301,7 @@ impl Store {
         {
             // The tantivy `CodeTokenizer` splits camelCase + path separators
             // itself, so we pass the raw `path` as the `path_tokens` field
-            // input — the SQL-side pre-split column (`code_chunks.path_tokens`)
-            // is no longer load-bearing and is left in place only to avoid a
-            // schema migration in this change.
+            // input — there's no SQL-side pre-split column anymore.
             //
             // Bodies aren't stored, so we reconstruct each chunk's text from
             // the file on disk. `ORDER BY path` groups a file's chunks
@@ -845,13 +851,8 @@ impl Store {
                 let id = base + 1 + i as i64;
                 conn.execute(
                     "INSERT INTO code_chunks(id, path, language, line_start, line_end,
-                                             kind, qualified, path_tokens)
-                     VALUES (?, ?, ?, ?, ?, ?, ?,
-                             lower(
-                                 regexp_replace(?, '[/_.\\-]', ' ', 'g')
-                                 || ' '
-                                 || regexp_replace(?, '([a-z])([A-Z])', '\\1 \\2', 'g')
-                             ))",
+                                             kind, qualified)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)",
                     params![
                         id,
                         path,
@@ -859,8 +860,6 @@ impl Store {
                         c.line_start,
                         c.line_end,
                         c.kind,
-                        c.qualified,
-                        path,
                         c.qualified,
                     ],
                 )?;
