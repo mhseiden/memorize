@@ -137,3 +137,23 @@ pub fn chunk_for_embedding(body: &str) -> Vec<&str> {
     }
     chunks
 }
+
+/// Extract the 1-based, inclusive line range `[start, end]` from `source`,
+/// rejoined with `\n`. Used to reconstruct a code chunk's body from the file
+/// on disk at recall/FTS-rebuild time instead of storing the text in the DB.
+///
+/// Returns an empty string when the range is degenerate or out of bounds
+/// (e.g. the file shrank since it was indexed). Callers treat an empty body
+/// as "no text available" rather than an error — for a changed file the
+/// caller has already flagged the chunk stale and queued a reindex.
+pub fn slice_lines(source: &str, start: u32, end: u32) -> String {
+    if start == 0 || end < start {
+        return String::new();
+    }
+    source
+        .lines()
+        .skip((start - 1) as usize)
+        .take((end - start + 1) as usize)
+        .collect::<Vec<_>>()
+        .join("\n")
+}

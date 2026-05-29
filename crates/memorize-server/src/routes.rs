@@ -4,6 +4,7 @@ use chrono::Utc;
 use memorize_core::{Kind, NewObservation, chunk_for_embedding, truncate_body};
 use memorize_recall::recall;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tiny_http::{Method, Request, Response, Server};
 
@@ -295,6 +296,18 @@ fn handle_code_search(state: &ServerState, req: Request, payload: CodeSearchReq)
         ..memorize_recall::CodeRecallConfig::default()
     };
     let results = memorize_recall::recall_code(&state.store, q, &q_emb, limit, &config)?;
+
+    // A stale result means the file changed since indexing, so the body we
+    // just sliced from disk may be misaligned. Queue an out-of-band reindex
+    // (deduped per path) so the next recall is correct. Skip when the indexer
+    // is disabled — nothing would drain the queue.
+    if state.config.code_index.enabled {
+        for r in &results {
+            if r.stale {
+                state.reindex_queue.request(PathBuf::from(&r.path));
+            }
+        }
+    }
 
     respond_json(
         req,

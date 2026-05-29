@@ -195,13 +195,21 @@ fn hydrate(store: &Store, picked: &[(i64, f64)]) -> Result<Vec<CodeRecalled>> {
     let rows = store.get_code_chunks_by_ids(&ids)?;
     let scores: Vec<f64> = picked.iter().map(|(_, s)| *s).collect();
 
-    // Batch FileMeta lookups: one query per unique path. With max_per_file=2
-    // and limit=10, ≤10 lookups per recall.
+    // One FileMeta lookup + one file read per unique path. With max_per_file=2
+    // and limit=10 that's ≤10 of each per recall. Bodies aren't stored, so we
+    // slice each chunk's text out of the file on disk. We read the offsets
+    // regardless of staleness: for an unchanged file they're exact; for a
+    // changed file they may be wrong, but `stale` flags that and the route
+    // queues an async reindex. A missing/unreadable file yields an empty body.
     let unique_paths: HashSet<&str> = rows.iter().map(|r| r.path.as_str()).collect();
     let mut metas: HashMap<String, FileMeta> = HashMap::with_capacity(unique_paths.len());
+    let mut sources: HashMap<String, String> = HashMap::with_capacity(unique_paths.len());
     for path in unique_paths {
         if let Ok(Some(m)) = store.get_file_meta(path) {
             metas.insert(path.to_string(), m);
+        }
+        if let Ok(src) = std::fs::read_to_string(path) {
+            sources.insert(path.to_string(), src);
         }
     }
 
@@ -210,6 +218,12 @@ fn hydrate(store: &Store, picked: &[(i64, f64)]) -> Result<Vec<CodeRecalled>> {
         .zip(scores)
         .map(|(r, score)| {
             let stale = is_stale(&r.path, metas.get(&r.path));
+            let body = match sources.get(&r.path) {
+                Some(src) => {
+                    memorize_core::slice_lines(src, r.line_start as u32, r.line_end as u32)
+                }
+                None => String::new(),
+            };
             CodeRecalled {
                 id: r.id,
                 path: r.path,
@@ -218,7 +232,7 @@ fn hydrate(store: &Store, picked: &[(i64, f64)]) -> Result<Vec<CodeRecalled>> {
                 line_end: r.line_end,
                 kind: r.kind,
                 qualified: r.qualified,
-                body: r.body,
+                body,
                 score,
                 stale,
             }

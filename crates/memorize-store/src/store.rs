@@ -1,8 +1,9 @@
 use crate::DEFAULT_EMBED_DIM;
 use crate::fts::FtsIndex;
 use crate::schema::{
-    backfill_path_tokens_sql, migrate_vec_chunks_to_int8_sql, migrate_vec_code_to_int8_sql,
-    schema_sql, vec_chunks_legacy_emb_probe_sql, vec_code_legacy_emb_probe_sql,
+    backfill_path_tokens_sql, code_chunks_has_body_probe_sql, drop_code_chunk_body_sql,
+    migrate_vec_chunks_to_int8_sql, migrate_vec_code_to_int8_sql, schema_sql,
+    vec_chunks_legacy_emb_probe_sql, vec_code_legacy_emb_probe_sql,
 };
 use crate::synonyms_seed::DEFAULT_PAIRS;
 use anyhow::{Context, Result, bail};
@@ -91,6 +92,9 @@ pub struct CodeVectorHit {
     pub score: f64,
 }
 
+/// A chunk as handed to the indexer for insert. Carries `body` because the
+/// indexer has the freshly-parsed text in hand and feeds it straight to the
+/// FTS index — but the body is no longer persisted to DuckDB.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CodeChunkRow {
     pub id: i64,
@@ -101,6 +105,19 @@ pub struct CodeChunkRow {
     pub kind: String,
     pub qualified: String,
     pub body: String,
+}
+
+/// A chunk as read back from DuckDB for recall. No `body`: callers
+/// reconstruct it by reading `[line_start, line_end]` from the file on disk.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CodeChunkMeta {
+    pub id: i64,
+    pub path: String,
+    pub language: String,
+    pub line_start: i32,
+    pub line_end: i32,
+    pub kind: String,
+    pub qualified: String,
 }
 
 /// File-level metadata as stored in the `files` table — used by the indexer
@@ -235,6 +252,19 @@ impl Store {
 
         conn.execute_batch(backfill_path_tokens_sql())
             .context("backfill path_tokens")?;
+
+        // One-time: drop the now-dead chunk `body`/`body_hash` columns. Bodies
+        // are reconstructed from file line ranges (see `slice_lines`) at
+        // recall/FTS-rebuild time; `body_hash` was already write-only. Gated so
+        // it only fires on DBs that still have the columns.
+        let has_body: bool = conn
+            .query_row(code_chunks_has_body_probe_sql(), [], |r| r.get(0))
+            .unwrap_or(false);
+        if has_body {
+            eprintln!("memorize-store: dropping code_chunks.body/body_hash (one-time)...");
+            conn.execute_batch(drop_code_chunk_body_sql())
+                .context("drop code_chunks body columns")?;
+        }
         drop(conn);
         self.seed_synonyms_once()?;
         Ok(())
@@ -266,15 +296,39 @@ impl Store {
             // input — the SQL-side pre-split column (`code_chunks.path_tokens`)
             // is no longer load-bearing and is left in place only to avoid a
             // schema migration in this change.
-            let mut stmt = conn
-                .prepare("SELECT id, path, language, body, qualified FROM code_chunks")?;
+            //
+            // Bodies aren't stored, so we reconstruct each chunk's text from
+            // the file on disk. `ORDER BY path` groups a file's chunks
+            // consecutively, so we read each file at most once and slice every
+            // chunk out of that single in-memory copy. This is the startup
+            // cost of dropping `body`: a DB scan plus one read per indexed
+            // file. A file that changed (or vanished) since indexing yields
+            // wrong/empty text here — transient, since the cold-scan that runs
+            // right after reindexes changed files and corrects the FTS.
+            let mut stmt = conn.prepare(
+                "SELECT id, path, language, line_start, line_end, qualified
+                   FROM code_chunks ORDER BY path",
+            )?;
             let mut rows = stmt.query([])?;
+            let mut cur_path: Option<String> = None;
+            let mut cur_source: Option<String> = None;
             while let Some(row) = rows.next()? {
                 let id: i64 = row.get(0)?;
                 let path: String = row.get(1)?;
                 let language: String = row.get(2)?;
-                let body: String = row.get(3)?;
-                let qualified: String = row.get(4)?;
+                let line_start: i32 = row.get(3)?;
+                let line_end: i32 = row.get(4)?;
+                let qualified: String = row.get(5)?;
+                if cur_path.as_deref() != Some(path.as_str()) {
+                    cur_source = std::fs::read_to_string(&path).ok();
+                    cur_path = Some(path.clone());
+                }
+                let body = match &cur_source {
+                    Some(src) => {
+                        memorize_core::slice_lines(src, line_start as u32, line_end as u32)
+                    }
+                    None => String::new(),
+                };
                 self.fts
                     .insert_code(id, &path, &language, &body, &qualified, &path)?;
                 n_code += 1;
@@ -791,8 +845,8 @@ impl Store {
                 let id = base + 1 + i as i64;
                 conn.execute(
                     "INSERT INTO code_chunks(id, path, language, line_start, line_end,
-                                             kind, qualified, body, body_hash, path_tokens)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                             kind, qualified, path_tokens)
+                     VALUES (?, ?, ?, ?, ?, ?, ?,
                              lower(
                                  regexp_replace(?, '[/_.\\-]', ' ', 'g')
                                  || ' '
@@ -806,8 +860,6 @@ impl Store {
                         c.line_end,
                         c.kind,
                         c.qualified,
-                        c.body,
-                        hash_bytes(c.body.as_bytes()),
                         path,
                         c.qualified,
                     ],
@@ -1239,22 +1291,22 @@ impl Store {
         Ok(())
     }
 
-    pub fn get_code_chunks_by_ids(&self, ids: &[i64]) -> Result<Vec<CodeChunkRow>> {
+    pub fn get_code_chunks_by_ids(&self, ids: &[i64]) -> Result<Vec<CodeChunkMeta>> {
         if ids.is_empty() {
             return Ok(vec![]);
         }
         let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT id, path, language, line_start, line_end, kind, qualified, body
+            "SELECT id, path, language, line_start, line_end, kind, qualified
                FROM code_chunks WHERE id IN ({placeholders})"
         );
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&sql)?;
         let params: Vec<&dyn duckdb::ToSql> =
             ids.iter().map(|id| id as &dyn duckdb::ToSql).collect();
-        let mut by_id: std::collections::HashMap<i64, CodeChunkRow> = stmt
+        let mut by_id: std::collections::HashMap<i64, CodeChunkMeta> = stmt
             .query_map(params.as_slice(), |row| {
-                Ok(CodeChunkRow {
+                Ok(CodeChunkMeta {
                     id: row.get(0)?,
                     path: row.get(1)?,
                     language: row.get(2)?,
@@ -1262,7 +1314,6 @@ impl Store {
                     line_end: row.get(4)?,
                     kind: row.get(5)?,
                     qualified: row.get(6)?,
-                    body: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?
@@ -1385,15 +1436,6 @@ impl ObsVecCache {
         self.obs_ids.push(obs_id);
         self.vecs.push(vec);
     }
-}
-
-/// SHA-256 of arbitrary bytes. Used to detect when a code chunk's body is
-/// unchanged between re-indexes so we can skip embedding work.
-fn hash_bytes(bytes: &[u8]) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(bytes);
-    h.finalize().to_vec()
 }
 
 #[cfg(test)]

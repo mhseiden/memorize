@@ -85,8 +85,10 @@ CREATE TABLE IF NOT EXISTS files (
     git_rev    VARCHAR
 );
 
--- One row per AST chunk. Body hash makes re-indexing the same file a no-op
--- when content didn't change.
+-- One row per AST chunk. Bodies are NOT stored: recall and FTS rebuild
+-- reconstruct chunk text by reading `[line_start, line_end]` from the file
+-- on disk (see `slice_lines`). The `files` row's mtime/size tells recall
+-- whether the on-disk text still matches what was indexed.
 CREATE TABLE IF NOT EXISTS code_chunks (
     id          BIGINT  PRIMARY KEY,
     path        VARCHAR NOT NULL,
@@ -95,8 +97,6 @@ CREATE TABLE IF NOT EXISTS code_chunks (
     line_end    INTEGER NOT NULL,
     kind        VARCHAR NOT NULL,
     qualified   VARCHAR NOT NULL,
-    body        VARCHAR NOT NULL,
-    body_hash   BLOB    NOT NULL,
     -- FTS-friendly tokenization of (path + qualified). Path separators
     -- (`/_-.`) flatten to spaces, and camelCase identifiers in `qualified`
     -- split on case boundaries (`snapshotMemoGraph` → `snapshot Memo Graph`).
@@ -185,6 +185,26 @@ pub fn vec_chunks_legacy_emb_probe_sql() -> &'static str {
     "SELECT count(*) > 0
        FROM duckdb_columns
       WHERE table_name = 'vec_chunks' AND column_name = 'emb'"
+}
+
+/// True iff `code_chunks` still has the legacy stored-`body` column. Gates the
+/// one-time drop below so the ALTER + CHECKPOINT only runs on pre-existing DBs.
+pub fn code_chunks_has_body_probe_sql() -> &'static str {
+    "SELECT count(*) > 0
+       FROM duckdb_columns
+      WHERE table_name = 'code_chunks' AND column_name = 'body'"
+}
+
+/// Drop the now-unused `body` and `body_hash` columns from `code_chunks` and
+/// CHECKPOINT so the freed pages are actually reclaimable. Chunk text now
+/// comes from reading file line ranges; `body_hash` was already write-only.
+/// One-time: gated by `code_chunks_has_body_probe_sql`. Note that DROP COLUMN
+/// alone doesn't shrink the file — DuckDB reuses the freed pages for future
+/// writes. Compacting into a fresh file (`COPY FROM DATABASE`) reclaims it.
+pub fn drop_code_chunk_body_sql() -> &'static str {
+    "ALTER TABLE code_chunks DROP COLUMN IF EXISTS body;
+     ALTER TABLE code_chunks DROP COLUMN IF EXISTS body_hash;
+     CHECKPOINT;"
 }
 
 /// Force-recompute `path_tokens` on store init. Cheap at our scale (~84k

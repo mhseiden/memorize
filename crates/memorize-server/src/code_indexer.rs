@@ -24,9 +24,41 @@ use notify::RecursiveMode;
 use notify_debouncer_full::DebouncedEvent;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+/// De-duplicating queue of paths that recall found stale and wants re-indexed
+/// out of band. Recall returns the on-disk text at the old line offsets (which
+/// may be wrong for a changed file) and enqueues the path here; this queue
+/// feeds a worker that re-parses the file so the next recall is correct.
+///
+/// Backed by a `HashSet` so a burst of stale chunks for the same file collapses
+/// into a single reindex.
+#[derive(Default)]
+pub struct ReindexQueue {
+    inner: Mutex<HashSet<PathBuf>>,
+    ready: Condvar,
+}
+
+impl ReindexQueue {
+    /// Enqueue a path for reindex. Non-blocking; duplicates collapse.
+    pub fn request(&self, path: PathBuf) {
+        let mut q = self.inner.lock().unwrap();
+        if q.insert(path) {
+            self.ready.notify_one();
+        }
+    }
+
+    /// Block until at least one path is queued, then take all of them.
+    fn drain_blocking(&self) -> Vec<PathBuf> {
+        let mut q = self.inner.lock().unwrap();
+        while q.is_empty() {
+            q = self.ready.wait(q).unwrap();
+        }
+        q.drain().collect()
+    }
+}
 
 pub fn spawn(state: Arc<ServerState>) {
     if !state.config.code_index.enabled {
@@ -106,10 +138,56 @@ pub fn spawn(state: Arc<ServerState>) {
             total_chunks_in_index: state.store.count_code_chunks().unwrap_or(0),
         });
 
+        // Out-of-band reindex worker: drains paths that recall flagged stale.
+        // Its own thread because `drain_watcher` below never returns.
+        {
+            let state = state.clone();
+            let roots = roots.clone();
+            std::thread::spawn(move || reindex_worker(&state, &roots));
+        }
+
         // Drain watcher events forever. `tx` lives because the debouncer
         // (held inside `start_watcher`'s returned guard) keeps it alive.
         drain_watcher(&state, &roots, &log, &rx, tx);
     });
+}
+
+/// Service `ServerState::reindex_queue` forever: re-parse each stale path so
+/// the next recall sees correct chunks. A path whose file no longer exists is
+/// dropped from the index instead of reparsed.
+fn reindex_worker(state: &ServerState, roots: &[PathBuf]) {
+    let log = IndexerLog::open();
+    loop {
+        for path in state.reindex_queue.drain_blocking() {
+            if !path.exists() {
+                let _ = state.store.delete_code_file(&path.to_string_lossy());
+                continue;
+            }
+            let Some(root) = root_for_path(roots, &path) else {
+                continue;
+            };
+            if let Err(e) = index_file(state, root, &path, &log) {
+                log.write(&LogEvent::Error {
+                    ts: now(),
+                    at: "reindex",
+                    path: Some(path.display().to_string()),
+                    msg: e.to_string(),
+                });
+                state
+                    .indexer_status
+                    .record_error(format!("reindex {}: {e}", path.display()));
+            }
+        }
+    }
+}
+
+/// Pick the indexed root that contains `path` — the longest matching prefix,
+/// so nested roots resolve to the most specific one.
+fn root_for_path<'a>(roots: &'a [PathBuf], path: &Path) -> Option<&'a PathBuf> {
+    roots
+        .iter()
+        .filter(|r| path.starts_with(r))
+        .max_by_key(|r| r.components().count())
 }
 
 /// Re-split chunks so none exceed the embedder's max-seq window. Same logic

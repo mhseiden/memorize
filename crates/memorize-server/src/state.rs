@@ -1,3 +1,4 @@
+use crate::code_indexer::ReindexQueue;
 use crate::config::UserConfig;
 use crate::indexer_status::{IndexerSnapshot, IndexerStatus};
 use anyhow::Result;
@@ -18,6 +19,9 @@ pub struct ServerState {
     /// Live state of the indexer thread. Read by /status, written by the
     /// indexer.
     pub indexer_status: IndexerStatus,
+    /// Paths recall flagged stale, awaiting out-of-band reindex. Written by
+    /// the code-search route, drained by the indexer's reindex worker.
+    pub reindex_queue: Arc<ReindexQueue>,
 }
 
 impl ServerState {
@@ -70,6 +74,7 @@ impl ServerState {
             token_budget,
             config: Arc::new(config),
             indexer_status: IndexerStatus::new(initial),
+            reindex_queue: Arc::new(ReindexQueue::default()),
         })
     }
 
@@ -88,6 +93,7 @@ impl ServerState {
             token_budget,
             config: Arc::new(config),
             indexer_status: IndexerStatus::new(initial),
+            reindex_queue: Arc::new(ReindexQueue::default()),
         })
     }
 }

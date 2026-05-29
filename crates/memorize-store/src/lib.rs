@@ -14,7 +14,7 @@ pub mod store;
 pub mod synonyms_seed;
 
 pub use store::{
-    BM25Hit, CodeBM25Hit, CodeChunkRow, CodeVectorHit, FileMeta, Store, VectorHit,
+    BM25Hit, CodeBM25Hit, CodeChunkMeta, CodeChunkRow, CodeVectorHit, FileMeta, Store, VectorHit,
 };
 
 /// Default embedding dimensionality (MiniLM-L6-v2). Stores opened via
