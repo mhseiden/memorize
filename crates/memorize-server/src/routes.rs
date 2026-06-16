@@ -258,6 +258,7 @@ fn handle_status(state: &ServerState, req: Request) -> Result<()> {
             }
         },
         "indexer": indexer,
+        "churn": state.indexer_status.churn_summary(),
     });
     respond_json(req, 200, &payload)
 }
@@ -504,7 +505,12 @@ fn respond_text(req: Request, status: u16, body: &str) -> Result<()> {
 }
 
 fn log(msg: &str) {
+    // Always emit via tracing now (level filtered by MEMORIZE_LOG, default
+    // info). The legacy MEMORIZE_VERBOSE flag still forces it to info so old
+    // setups keep printing; otherwise it's a debug line.
     if std::env::var(VERBOSE_ENV).is_ok() {
-        eprintln!("[memorize] {msg}");
+        tracing::info!("{msg}");
+    } else {
+        tracing::debug!("{msg}");
     }
 }

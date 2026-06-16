@@ -224,11 +224,11 @@ impl Store {
             .query_row(vec_code_legacy_emb_probe_sql(), [], |r| r.get(0))
             .unwrap_or(false);
         if has_legacy_emb {
-            eprintln!("memorize-store: migrating vec_code.emb FLOAT→TINYINT (one-time)...");
+            tracing::info!("memorize-store: migrating vec_code.emb FLOAT→TINYINT (one-time)...");
             let t = std::time::Instant::now();
             conn.execute_batch(&migrate_vec_code_to_int8_sql(self.embed_dim))
                 .context("migrate vec_code to int8")?;
-            eprintln!(
+            tracing::info!(
                 "memorize-store: vec_code int8 migration done in {:.1}s",
                 t.elapsed().as_secs_f64()
             );
@@ -241,11 +241,11 @@ impl Store {
             .query_row(vec_chunks_legacy_emb_probe_sql(), [], |r| r.get(0))
             .unwrap_or(false);
         if has_obs_legacy {
-            eprintln!("memorize-store: migrating vec_chunks.emb FLOAT→TINYINT (one-time)...");
+            tracing::info!("memorize-store: migrating vec_chunks.emb FLOAT→TINYINT (one-time)...");
             let t = std::time::Instant::now();
             conn.execute_batch(&migrate_vec_chunks_to_int8_sql(self.embed_dim))
                 .context("migrate vec_chunks to int8")?;
-            eprintln!(
+            tracing::info!(
                 "memorize-store: vec_chunks int8 migration done in {:.1}s",
                 t.elapsed().as_secs_f64()
             );
@@ -261,7 +261,7 @@ impl Store {
             .query_row(code_chunks_has_body_probe_sql(), [], |r| r.get(0))
             .unwrap_or(false);
         if has_body {
-            eprintln!("memorize-store: dropping code_chunks.body/body_hash (one-time)...");
+            tracing::info!("memorize-store: dropping code_chunks.body/body_hash (one-time)...");
             conn.execute_batch(drop_code_chunk_body_sql())
                 .context("drop code_chunks body columns")?;
         }
@@ -269,7 +269,7 @@ impl Store {
             .query_row(code_chunks_has_path_tokens_probe_sql(), [], |r| r.get(0))
             .unwrap_or(false);
         if has_path_tokens {
-            eprintln!("memorize-store: dropping code_chunks.path_tokens (one-time)...");
+            tracing::info!("memorize-store: dropping code_chunks.path_tokens (one-time)...");
             conn.execute_batch(drop_code_chunk_path_tokens_sql())
                 .context("drop code_chunks path_tokens column")?;
         }
@@ -342,7 +342,7 @@ impl Store {
         }
         drop(conn);
         self.fts.commit()?;
-        eprintln!(
+        tracing::info!(
             "memorize-store: fts rebuilt in {:.1}s ({} obs, {} code chunks)",
             t.elapsed().as_secs_f64(),
             n_obs,
@@ -1236,7 +1236,7 @@ impl Store {
             let n = ids.len();
             let cache = VecCache { ids, vecs, by_id };
             let _ = self.vec_cache.set(RwLock::new(cache));
-            eprintln!(
+            tracing::info!(
                 "memorize-store: vec_cache (code) loaded ({} vectors in {:.1}s)",
                 n,
                 t.elapsed().as_secs_f64()
@@ -1254,7 +1254,7 @@ impl Store {
             let n = obs_ids.len();
             let cache = ObsVecCache { obs_ids, vecs };
             let _ = self.obs_vec_cache.set(RwLock::new(cache));
-            eprintln!(
+            tracing::info!(
                 "memorize-store: obs_vec_cache loaded ({} vectors in {:.1}s)",
                 n,
                 t.elapsed().as_secs_f64()

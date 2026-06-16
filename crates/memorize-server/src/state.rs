@@ -67,13 +67,14 @@ impl ServerState {
             config.code_index.roots.clone(),
             config.code_index.enabled,
         );
+        let churn_window = config.code_index.churn_window_secs;
         Ok(Self {
             store,
             dedup: Arc::new(Dedup::new()),
             privacy: Arc::new(PrivacyFilter::new()),
             token_budget,
             config: Arc::new(config),
-            indexer_status: IndexerStatus::new(initial),
+            indexer_status: IndexerStatus::new(initial, churn_window),
             reindex_queue: Arc::new(ReindexQueue::default()),
         })
     }
@@ -86,13 +87,14 @@ impl ServerState {
             config.code_index.roots.clone(),
             config.code_index.enabled,
         );
+        let churn_window = config.code_index.churn_window_secs;
         Ok(Self {
             store: Arc::new(store),
             dedup: Arc::new(Dedup::new()),
             privacy: Arc::new(PrivacyFilter::new()),
             token_budget,
             config: Arc::new(config),
-            indexer_status: IndexerStatus::new(initial),
+            indexer_status: IndexerStatus::new(initial, churn_window),
             reindex_queue: Arc::new(ReindexQueue::default()),
         })
     }

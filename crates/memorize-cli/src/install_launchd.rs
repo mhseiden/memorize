@@ -138,6 +138,10 @@ fn plist_xml(bin: &std::path::Path, stdout: &std::path::Path, stderr: &std::path
              keeps the merged server.log focused on HTTP traffic. -->
         <key>MEMORIZE_VERBOSE</key>
         <string>1</string>
+        <!-- tracing log level (server.log). memorize at info; silence tantivy's
+             chatty segment-merge logs so the heartbeat + status stay readable. -->
+        <key>MEMORIZE_LOG</key>
+        <string>info,tantivy=warn</string>
     </dict>
 
     <!-- Run as the logged-in user; no special privileges. -->

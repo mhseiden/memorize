@@ -136,7 +136,23 @@ enum SynOp {
     List,
 }
 
+/// Human-readable logs to stderr (launchd routes `serve`'s stderr to
+/// ~/.memorize/server.log). Level via `MEMORIZE_LOG` (default `info`); set
+/// `MEMORIZE_LOG=debug` for per-event tracing. Structured per-file events still
+/// go to the JSONL `indexer.log` -- this is the operator-facing stream.
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_env("MEMORIZE_LOG")
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .try_init();
+}
+
 fn main() -> Result<()> {
+    init_tracing();
     let cli = Cli::parse();
     let cfg = Config::load();
     match cli.cmd {

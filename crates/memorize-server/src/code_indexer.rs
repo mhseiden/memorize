@@ -62,14 +62,14 @@ impl ReindexQueue {
 
 pub fn spawn(state: Arc<ServerState>) {
     if !state.config.code_index.enabled {
-        let log = IndexerLog::open();
+        let log = IndexerLog::open(state.config.code_index.max_indexer_log_bytes);
         log.write(&LogEvent::Disabled { ts: now() });
         state.indexer_status.set_phase(IndexerPhase::Disabled);
         return;
     }
 
     std::thread::spawn(move || {
-        let log = IndexerLog::open();
+        let log = IndexerLog::open(state.config.code_index.max_indexer_log_bytes);
         let roots = resolved_roots(&state.config.code_index.roots);
         log.write(&LogEvent::Started {
             ts: now(),
@@ -156,7 +156,7 @@ pub fn spawn(state: Arc<ServerState>) {
 /// the next recall sees correct chunks. A path whose file no longer exists is
 /// dropped from the index instead of reparsed.
 fn reindex_worker(state: &ServerState, roots: &[PathBuf]) {
-    let log = IndexerLog::open();
+    let log = IndexerLog::open(state.config.code_index.max_indexer_log_bytes);
     loop {
         for path in state.reindex_queue.drain_blocking() {
             if !path.exists() {
@@ -325,6 +325,18 @@ fn is_excluded(path: &Path, excludes: &[String]) -> bool {
     excludes.iter().any(|pat| s.contains(pat.as_str()))
 }
 
+/// Coarse event class for the churn `by_kind` histogram.
+fn coarse_kind(kind: &notify::EventKind) -> &'static str {
+    use notify::EventKind;
+    match kind {
+        EventKind::Create(_) => "create",
+        EventKind::Modify(_) => "modify",
+        EventKind::Remove(_) => "remove",
+        EventKind::Access(_) => "access",
+        _ => "other",
+    }
+}
+
 fn language_allowed(path: &Path, allow: &[String]) -> bool {
     let lang = match language_for_path(path) {
         Some(l) => l,
@@ -479,6 +491,11 @@ fn drain_watcher(
     // Use recv_timeout so we can transition phase to Idle when quiet.
     // FTS is updated synchronously inside each `upsert_code_file` /
     // `delete_code_file`, so no periodic rebuild is needed here.
+    let mut last_beat = Instant::now();
+    let mut last_counts = {
+        let s = state.indexer_status.snapshot();
+        (s.files_indexed, s.files_skipped, s.files_excluded)
+    };
     loop {
         match rx.recv_timeout(Duration::from_secs(30)) {
             Ok(Ok(events)) => {
@@ -506,7 +523,44 @@ fn drain_watcher(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+        maybe_heartbeat(state, &mut last_beat, &mut last_counts);
     }
+}
+
+/// Emit a periodic operator-facing summary to the human log (stderr →
+/// server.log). Silent during quiet periods so the log stays useful.
+fn maybe_heartbeat(state: &ServerState, last_beat: &mut Instant, last: &mut (u64, u64, u64)) {
+    const HEARTBEAT: Duration = Duration::from_secs(60);
+    if last_beat.elapsed() < HEARTBEAT {
+        return;
+    }
+    *last_beat = Instant::now();
+    let snap = state.indexer_status.snapshot();
+    let cur = (snap.files_indexed, snap.files_skipped, snap.files_excluded);
+    let (di, ds, de) = (
+        cur.0.saturating_sub(last.0),
+        cur.1.saturating_sub(last.1),
+        cur.2.saturating_sub(last.2),
+    );
+    *last = cur;
+    let churn = state.indexer_status.churn_summary();
+    if churn.events == 0 && di == 0 && ds == 0 && de == 0 {
+        return; // nothing happened — don't spam the log
+    }
+    let top = churn
+        .top_paths
+        .first()
+        .map(|p| format!("{} ({}x)", p.path, p.count))
+        .unwrap_or_else(|| "-".to_string());
+    tracing::info!(
+        window_events = churn.events,
+        events_per_min = format!("{:.1}", churn.events_per_min),
+        indexed = di,
+        skipped = ds,
+        excluded = de,
+        top_churn = %top,
+        "indexer heartbeat"
+    );
 }
 
 fn handle_event(
@@ -517,18 +571,22 @@ fn handle_event(
 ) {
     use notify::EventKind;
     let cfg = &state.config.code_index;
+    let kind = coarse_kind(&event.kind);
     for path in &event.paths {
+        // Exclude first: `.git/`, `node_modules/`, etc. generate enormous event
+        // volume (lock files, refs, index). Filtering before we record keeps
+        // them out of the churn surface and the indexer.log entirely.
+        if is_excluded(path, &cfg.excludes) {
+            continue;
+        }
         state
             .indexer_status
-            .record_event(path.display().to_string());
+            .record_event(path.display().to_string(), kind.to_string());
         log.write(&LogEvent::WatcherEvent {
             ts: now(),
             path: path.display().to_string(),
             kind: format!("{:?}", event.kind),
         });
-        if is_excluded(path, &cfg.excludes) {
-            continue;
-        }
         match event.kind {
             EventKind::Remove(_) => {
                 let _ = state.store.delete_code_file(&path.to_string_lossy());
@@ -550,5 +608,57 @@ fn handle_event(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::ModifyKind;
+    use notify::{Event, EventKind};
+
+    fn modify_event(path: &str) -> DebouncedEvent {
+        let ev = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(PathBuf::from(path));
+        DebouncedEvent::new(ev, Instant::now())
+    }
+
+    /// Regression: `.git/` (and other excluded) events must be filtered BEFORE
+    /// they touch the churn surface or the indexer log. Before the fix the
+    /// exclude check ran after `record_event` + `log.write`, so git lock-file
+    /// churn flooded both.
+    #[test]
+    fn excluded_paths_never_enter_churn_or_log() {
+        // Redirect the indexer log so the test never writes the real one.
+        let tmp = std::env::temp_dir().join(format!("memorize-test-{}.log", std::process::id()));
+        // SAFETY: single test, restored implicitly at process exit; we only
+        // need the path redirected for this thread's IndexerLog::open below.
+        unsafe { std::env::set_var("MEMORIZE_INDEXER_LOG", &tmp) };
+        let _ = std::fs::remove_file(&tmp);
+
+        let state = ServerState::in_memory(8192).expect("in-memory state");
+        let roots = vec![PathBuf::from("/repo")];
+        let log = IndexerLog::open(0);
+
+        // Excluded: must leave churn empty and write nothing.
+        handle_event(&state, &roots, &log, &modify_event("/repo/.git/index.lock"));
+        assert_eq!(
+            state.indexer_status.churn_summary().events,
+            0,
+            "excluded .git event leaked into churn"
+        );
+
+        // Non-excluded source path is recorded once (indexing itself may fail
+        // because the file doesn't exist, but record happens first).
+        handle_event(&state, &roots, &log, &modify_event("/repo/src/main.rs"));
+        let churn = state.indexer_status.churn_summary();
+        assert_eq!(churn.events, 1, "source event should be recorded exactly once");
+        assert_eq!(churn.top_paths[0].path, "/repo/src/main.rs");
+
+        let logged = std::fs::read_to_string(&tmp).unwrap_or_default();
+        assert!(
+            !logged.contains(".git/index.lock"),
+            "excluded path must not appear in the indexer log"
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 }

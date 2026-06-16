@@ -35,6 +35,10 @@ pub struct CodeIndexConfig {
     pub debounce_ms: u64,
     /// Master switch — false disables the whole indexer thread.
     pub enabled: bool,
+    /// Rolling window (seconds) for the `/status` churn summary + heartbeat.
+    pub churn_window_secs: u64,
+    /// Size cap for `~/.memorize/indexer.log`; rotated to `.1` when exceeded.
+    pub max_indexer_log_bytes: u64,
 }
 
 impl Default for CodeIndexConfig {
@@ -47,6 +51,8 @@ impl Default for CodeIndexConfig {
             respect_gitignore: true,
             debounce_ms: 250,
             enabled: true,
+            churn_window_secs: 600,
+            max_indexer_log_bytes: 16_777_216,
         }
     }
 }
@@ -173,6 +179,13 @@ debounce_ms = 250
 # Master switch. false disables the indexer thread entirely.
 # Env override: MEMORIZE_CODE_INDEX=0
 enabled = true
+
+# Rolling window (seconds) for the /status churn summary and the log heartbeat.
+churn_window_secs = 600
+
+# Size cap for ~/.memorize/indexer.log. When exceeded it is rotated to
+# indexer.log.1 (single generation) so the activity log stays bounded.
+max_indexer_log_bytes = 16777216
 "#
     .to_string()
 }

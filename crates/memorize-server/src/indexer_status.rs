@@ -4,8 +4,9 @@
 //! Updated under a Mutex from the indexer thread. Reads are cheap snapshots.
 
 use serde::Serialize;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -67,22 +68,134 @@ impl IndexerSnapshot {
     }
 }
 
+/// One churning path and how many events it drew within the window.
+#[derive(Debug, Clone, Serialize)]
+pub struct PathCount {
+    pub path: String,
+    pub count: u64,
+}
+
+/// Rolling view of recent watcher events — the surface for root-causing churn.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChurnSummary {
+    pub window_secs: u64,
+    pub events: u64,
+    pub events_per_min: f64,
+    /// Hottest paths within the window, descending.
+    pub top_paths: Vec<PathCount>,
+    /// Events grouped by configured root (longest-prefix match), else "other".
+    pub by_root: HashMap<String, u64>,
+    /// Events grouped by coarse notify kind (Create/Modify/Remove/…).
+    pub by_kind: HashMap<String, u64>,
+}
+
+/// Bounded rolling buffer of `(when, path, kind)` over the configured window.
+#[derive(Debug)]
+struct ChurnTracker {
+    window: Duration,
+    max_len: usize,
+    roots: Vec<String>,
+    top_n: usize,
+    events: VecDeque<(Instant, String, String)>,
+}
+
+impl ChurnTracker {
+    const MAX_LEN: usize = 5000;
+    const TOP_N: usize = 20;
+
+    fn new(window_secs: u64, roots: Vec<String>) -> Self {
+        Self {
+            window: Duration::from_secs(window_secs),
+            max_len: Self::MAX_LEN,
+            roots,
+            top_n: Self::TOP_N,
+            events: VecDeque::new(),
+        }
+    }
+
+    fn evict(&mut self, now: Instant) {
+        while let Some((ts, _, _)) = self.events.front() {
+            if now.duration_since(*ts) > self.window || self.events.len() > self.max_len {
+                self.events.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn record(&mut self, now: Instant, path: String, kind: String) {
+        self.events.push_back((now, path, kind));
+        self.evict(now);
+    }
+
+    fn summary(&mut self, now: Instant) -> ChurnSummary {
+        self.evict(now);
+        let mut paths: HashMap<&str, u64> = HashMap::new();
+        let mut by_root: HashMap<String, u64> = HashMap::new();
+        let mut by_kind: HashMap<String, u64> = HashMap::new();
+        for (_, path, kind) in &self.events {
+            *paths.entry(path.as_str()).or_default() += 1;
+            *by_kind.entry(kind.clone()).or_default() += 1;
+            let root = self
+                .roots
+                .iter()
+                .filter(|r| path.starts_with(r.as_str()))
+                .max_by_key(|r| r.len())
+                .cloned()
+                .unwrap_or_else(|| "other".to_string());
+            *by_root.entry(root).or_default() += 1;
+        }
+        let mut top: Vec<PathCount> = paths
+            .into_iter()
+            .map(|(p, c)| PathCount { path: p.to_string(), count: c })
+            .collect();
+        top.sort_by(|a, b| b.count.cmp(&a.count).then(a.path.cmp(&b.path)));
+        top.truncate(self.top_n);
+        let events = self.events.len() as u64;
+        let window_secs = self.window.as_secs();
+        let events_per_min = if window_secs == 0 {
+            0.0
+        } else {
+            events as f64 * 60.0 / window_secs as f64
+        };
+        ChurnSummary {
+            window_secs,
+            events,
+            events_per_min,
+            top_paths: top,
+            by_root,
+            by_kind,
+        }
+    }
+}
+
 /// Shared handle. Cloning is cheap (Arc) — every component that touches the
 /// status grabs a reference.
 #[derive(Debug, Clone)]
 pub struct IndexerStatus {
     inner: std::sync::Arc<Mutex<IndexerSnapshot>>,
+    churn: std::sync::Arc<Mutex<ChurnTracker>>,
     started_at: Instant,
 }
 
 const MAX_RECENT_ERRORS: usize = 8;
 
 impl IndexerStatus {
-    pub fn new(initial: IndexerSnapshot) -> Self {
+    pub fn new(initial: IndexerSnapshot, churn_window_secs: u64) -> Self {
+        let churn = ChurnTracker::new(churn_window_secs, initial.roots.clone());
         Self {
             inner: std::sync::Arc::new(Mutex::new(initial)),
+            churn: std::sync::Arc::new(Mutex::new(churn)),
             started_at: Instant::now(),
         }
+    }
+
+    /// Rolling churn view for `/status` and the heartbeat.
+    pub fn churn_summary(&self) -> ChurnSummary {
+        self.churn
+            .lock()
+            .expect("churn mutex")
+            .summary(Instant::now())
     }
 
     pub fn snapshot(&self) -> IndexerSnapshot {
@@ -131,8 +244,12 @@ impl IndexerStatus {
         });
     }
 
-    pub fn record_event(&self, path: String) {
+    pub fn record_event(&self, path: String, kind: String) {
         let ts = chrono::Utc::now().timestamp();
+        self.churn
+            .lock()
+            .expect("churn mutex")
+            .record(Instant::now(), path.clone(), kind);
         self.update(|s| {
             s.last_event_path = Some(path);
             s.last_event_ts = Some(ts);
